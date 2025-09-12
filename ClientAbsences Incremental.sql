@@ -1,9 +1,17 @@
+USE [DOM_LIVE]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
 ALTER PROCEDURE [dbo].[usp_Sync_ClientAbsences_Incremental]
-    @ChunkSize      int  = 100000,   -- tune as needed
-    @LockTimeoutMs  int  = 60000,
-    @UseAppLock     bit  = 1,
-    @EmitInfo       bit  = 0,                 -- NEW: 0 = quiet, 1 = print progress
-    @Summary        nvarchar(4000) = NULL OUTPUT   -- NEW: one-line summary
+    @ChunkSize         int  = 100000,        -- tune as needed
+    @LockTimeoutMs     int  = 60000,
+    @UseAppLock        bit  = 1,
+    @EmitInfo          bit  = 0,             -- 0 = quiet, 1 = print progress
+    @Summary           nvarchar(4000) = NULL OUTPUT,  -- one-line summary
+    @ReturnSummaryRow  bit  = 1              -- NEW: emit Stage/Summary row
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -38,6 +46,7 @@ BEGIN
         BEGIN
             IF @EmitInfo=1 RAISERROR('Could not acquire %s (sp_getapplock rc=%d).',16,1,@LockResource,@lockResult);
             SET @Summary = N'ClientAbsences incremental failed: could not acquire applock.';
+            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             RETURN @lockResult;
         END
         SET @lockHeld = 1;
@@ -51,6 +60,7 @@ BEGIN
         BEGIN
             IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
             SET @Summary = N'ClientAbsences incremental failed: CT not enabled at DB level.';
+            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
             RETURN -100;
         END
@@ -59,6 +69,7 @@ BEGIN
         BEGIN
             IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.INACTIVE_DY. Cannot proceed.',16,1);
             SET @Summary = N'ClientAbsences incremental failed: CT not enabled on dbo.INACTIVE_DY.';
+            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
             RETURN -210;
         END
@@ -97,6 +108,7 @@ BEGIN
         BEGIN
             IF @EmitInfo=1 RAISERROR('Watermark (%I64d) is older than CT min valid version (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
             SET @Summary = CONCAT(N'ClientAbsences incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N' (re-baseline).');
+            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
             RETURN -200;
         END
@@ -157,6 +169,8 @@ BEGIN
             );
 
             IF @EmitInfo=1 RAISERROR('No changes. Watermark advanced.', 0, 1) WITH NOWAIT;
+            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+
             IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
             RETURN 0;
         END
@@ -305,6 +319,8 @@ BEGIN
             RAISERROR('  Deleted  = %d', 0, 1, @TotalDeleted) WITH NOWAIT;
         END
 
+        IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
         RETURN 0;
     END TRY
@@ -315,6 +331,8 @@ BEGIN
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
         IF @EmitInfo=1 RAISERROR('usp_Sync_ClientAbsences_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',16,1,@num,@sev,@st,@procName,@lin,@msg);
         SET @Summary = CONCAT(N'ClientAbsences incremental failed: ', @msg);
+        IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;
     END CATCH
 END
+GO
