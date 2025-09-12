@@ -74,8 +74,8 @@ BEGIN
     NotChangedFromTemplate    BIT            NULL,
     NumberCarersOnVisit       INT            NULL,
     CancelPayFlag             NVARCHAR(4)    NULL,
-    CreatedAtUTC              datetime2(3),
-    UpdatedAtUTC              datetime2(3)
+    CreatedAtUTC              datetime2(3) NOT NULL,
+    UpdatedAtUTC              datetime2(3) NOT NULL
   );
 
   IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_tbl_Visits_ClientReference' AND object_id=OBJECT_ID('dbo.tbl_Visits'))

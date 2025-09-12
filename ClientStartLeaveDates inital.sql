@@ -43,7 +43,7 @@ BEGIN TRY
     /* 2) Take CT snapshot AT START so anything after this is picked up by incremental */
     SET @BaselineFrom = CHANGE_TRACKING_CURRENT_VERSION();
 
-    /* 3) Ensure watermark table exists and seed/refresh the row to the START snapshot */
+    /* 3) Ensure watermark table exists and seed/refresh row to the START snapshot */
     IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
     BEGIN
         CREATE TABLE dbo.CT_Watermark
@@ -54,14 +54,13 @@ BEGIN TRY
         );
     END
 
-    IF EXISTS (SELECT 1 FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process)
-        UPDATE dbo.CT_Watermark
-           SET LastSyncVersion = @BaselineFrom,
-               LastSyncTime    = SYSUTCDATETIME()
-         WHERE ProcessName = @Process;
-    ELSE
-        INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion, LastSyncTime)
-        VALUES (@Process, @BaselineFrom, SYSUTCDATETIME());
+    MERGE dbo.CT_Watermark AS t
+    USING (SELECT @Process AS ProcessName) AS s
+      ON t.ProcessName = s.ProcessName
+    WHEN MATCHED THEN
+      UPDATE SET LastSyncVersion = @BaselineFrom, LastSyncTime = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+      INSERT (ProcessName, LastSyncVersion) VALUES (@Process, @BaselineFrom);
 
     RAISERROR('Seeded ClientStartLeaveDates watermark to START snapshot %I64d.', 0, 1, @BaselineFrom) WITH NOWAIT;
 
@@ -81,7 +80,9 @@ BEGIN TRY
         GLOBAL_END_MONTH      TINYINT NULL,
         GLOBAL_END_YEAR       SMALLINT NULL,
         UPDATED_LEAVE_DATES   DATE NULL,
-        GLOBAL_STATUS         VARCHAR(50) NOT NULL
+        GLOBAL_STATUS         VARCHAR(50) NOT NULL,
+        CreatedAtUTC          datetime2(3) NOT NULL CONSTRAINT DF_tbl_ClientStartLeaveDates_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
+        UpdatedAtUTC          datetime2(3) NOT NULL CONSTRAINT DF_tbl_ClientStartLeaveDates_UpdatedAtUTC DEFAULT SYSUTCDATETIME()
     );
 
     /* 5) Populate (pre-aggregate per client, then compute globals) */
@@ -94,7 +95,7 @@ BEGIN TRY
             MIN(C.ClientStartDate)       AS MinClientStartDate,
             MAX(C.ClientLeaveDate)       AS MaxClientLeaveDate,
             MIN(V.VisitStartDate)        AS MinVisitStartDate,
-            MAX(C.ClientStatus)          AS ClientStatus   -- ClientStatus is grouped below, MAX used just to select a value
+            MAX(C.ClientStatus)          AS ClientStatus   -- grouped below; MAX just selects a value
         FROM dbo.tbl_Clients AS C
         LEFT JOIN dbo.tbl_Visits  AS V
                ON V.ClientReference = C.ClientReference
@@ -133,7 +134,9 @@ BEGIN TRY
         GLOBAL_END_MONTH,
         GLOBAL_END_YEAR,
         UPDATED_LEAVE_DATES,
-        GLOBAL_STATUS
+        GLOBAL_STATUS,
+        CreatedAtUTC,
+        UpdatedAtUTC
     )
     SELECT
         f.ClientReference,
@@ -160,7 +163,9 @@ BEGIN TRY
 
         ISNULL(CONVERT(DATE, f.GLOBAL_END_DATE), CONVERT(DATE, GETDATE())) AS UPDATED_LEAVE_DATES,
 
-        f.GLOBAL_STATUS
+        f.GLOBAL_STATUS,
+
+        @RunStartedAt, @RunStartedAt
     FROM Final AS f;
 
     DECLARE @rows int = @@ROWCOUNT;
@@ -169,9 +174,9 @@ BEGIN TRY
     /* 6) Do NOT advance the watermark here. We want the next incremental to pick up
           any changes that happened DURING this baseline (versions > @BaselineFrom). */
 
-    /* 7) Keys & indexes */
+    /* 7) Keys & indexes (after load) */
     ALTER TABLE dbo.tbl_ClientStartLeaveDates
-        ADD CONSTRAINT PK_ClientStartLeaveDates PRIMARY KEY CLUSTERED (ClientReference);
+        ADD CONSTRAINT PK_tbl_ClientStartLeaveDates_ClientReference PRIMARY KEY CLUSTERED (ClientReference);
 
     CREATE NONCLUSTERED INDEX IX_ClientStartLeave_WeekStart
         ON dbo.tbl_ClientStartLeaveDates (GLOBAL_WEEK_START);
