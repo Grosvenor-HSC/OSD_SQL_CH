@@ -226,16 +226,16 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             ;WITH Base AS
             (
                 SELECT
-                    ClientReference           = CAST(cdy.CLIENT_REF AS varchar(20)),
-                    ClientDiaryReference      = CAST(cdy.CL_DY_REF  AS varchar(20)),
-                    ClientDiaryEntryDate      = cdy.ENTRY_DATE,
-                    ClientDiaryEntryType      = cet.DESCRIPTION,
-                    ClientDiaryEntryText      = cdy.ENTRY_TEXT,
-                    ClientDiaryReminded       = cdy.REMINDED,
-                    ClientDiaryReviewDate     = cdy.REVIEW_DATE,
-                    ClientDiaryAction         = cdy.ACTION,
-                    ClientDiaryActionDate     = cdy.ACTIONDT,
-                    ClientDiaryReviewDoneDate = cdy.REVDONE_DT
+                    Client_UUID           = CAST(cdy.CLIENT_REF AS varchar(20)),
+                    UUID      = CAST(cdy.CL_DY_REF  AS varchar(20)),
+                    Client_Diary_Entry_Date      = cdy.ENTRY_DATE,
+                    Client_Diary_Entry_Type      = cet.DESCRIPTION,
+                    Client_Diary_Entry_Text      = cdy.ENTRY_TEXT,
+                    Client_Diary_Reminded       = cdy.REMINDED,
+                    Client_Diary_Review_Date     = cdy.REVIEW_DATE,
+                    Client_Diary_Action         = cdy.ACTION,
+                    Client_Diary_Action_Date     = cdy.ACTIONDT,
+                    Client_Diary_Review_Done_Date = cdy.REVDONE_DT
                 FROM dbo.CLIENT_DY cdy
                 JOIN #Next n
                   ON n.ClientRef = CAST(cdy.CLIENT_REF AS varchar(20))
@@ -252,28 +252,28 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
               AND tgt.ClientDiaryReference = src.ClientDiaryReference
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.ClientDiaryEntryDate      = src.ClientDiaryEntryDate,
-                    tgt.ClientDiaryEntryType      = src.ClientDiaryEntryType,
-                    tgt.ClientDiaryEntryText      = src.ClientDiaryEntryText,
-                    tgt.ClientDiaryReminded       = src.ClientDiaryReminded,
-                    tgt.ClientDiaryReviewDate     = src.ClientDiaryReviewDate,
-                    tgt.ClientDiaryAction         = src.ClientDiaryAction,
-                    tgt.ClientDiaryActionDate     = src.ClientDiaryActionDate,
-                    tgt.ClientDiaryReviewDoneDate = src.ClientDiaryReviewDoneDate,
+                    tgt.Client_Diary_Entry_Date      = src.Client_Diary_Entry_Date,
+                    tgt.Client_Diary_Entry_Type      = src.Client_Diary_Entry_Type,
+                    tgt.Client_Diary_Entry_Text      = src.Client_Diary_Entry_Text,
+                    tgt.Client_Diary_Reminded       = src.Client_Diary_Reminded,
+                    tgt.Client_Diary_Review_Date     = src.Client_Diary_Review_Date,
+                    tgt.Client_Diary_Action         = src.Client_Diary_Action,
+                    tgt.Client_Diary_Action_Date     = src.Client_Diary_Action_Date,
+                    tgt.Client_Diary_Review_Done_Date = src.Client_Diary_Review_Done_Date,
                     tgt.UpdatedAtUTC              = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (
-                    ClientReference, ClientDiaryReference,
-                    ClientDiaryEntryDate, ClientDiaryEntryType, ClientDiaryEntryText,
-                    ClientDiaryReminded, ClientDiaryReviewDate,
-                    ClientDiaryAction, ClientDiaryActionDate, ClientDiaryReviewDoneDate,
+                    Client_UUID, UUID,
+                    Client_Diary_Entry_Date, Client_Diary_Entry_Type, Client_Diary_Entry_Text,
+                    Client_Diary_Reminded, Client_Diary_Review_Date,
+                    Client_Diary_Action, Client_Diary_Action_Date, Client_Diary_Review_Done_Date,
                     CreatedAtUTC, UpdatedAtUTC
                 )
                 VALUES (
-                    src.ClientReference, src.ClientDiaryReference,
-                    src.ClientDiaryEntryDate, src.ClientDiaryEntryType, src.ClientDiaryEntryText,
-                    src.ClientDiaryReminded, src.ClientDiaryReviewDate,
-                    src.ClientDiaryAction, src.ClientDiaryActionDate, src.ClientDiaryReviewDoneDate,
+                    src.Client_UUID, src.UUID,
+                    src.Client_Diary_Entry_Date, src.Client_Diary_Entry_Type, src.Client_Diary_Entry_Text,
+                    src.Client_Diary_Reminded, src.Client_Diary_Review_Date,
+                    src.Client_Diary_Action, src.Client_Diary_Action_Date, src.Client_Diary_Review_Done_Date,
                     @RunStartedAt, @RunStartedAt
                 )
             WHEN NOT MATCHED BY SOURCE

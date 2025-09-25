@@ -1,3 +1,10 @@
+USE [DOM_LIVE]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
 CREATE OR ALTER PROCEDURE dbo.usp_Sync_ClientDiary_Initial
 AS
 BEGIN
@@ -46,7 +53,7 @@ BEGIN
 
         MERGE dbo.CT_Watermark AS t
         USING (SELECT @Process AS ProcessName) s
-        ON t.ProcessName = s.ProcessName
+          ON t.ProcessName = s.ProcessName
         WHEN MATCHED THEN
             UPDATE SET LastSyncVersion=@BaselineFrom, LastSyncTime=SYSUTCDATETIME()
         WHEN NOT MATCHED THEN
@@ -57,57 +64,63 @@ BEGIN
             DROP TABLE dbo.tbl_ClientDiary;
 
         CREATE TABLE dbo.tbl_ClientDiary (
-            ClientReference           VARCHAR(20)   NOT NULL,
-            ClientDiaryReference      VARCHAR(20)   NOT NULL,
-            ClientDiaryEntryDate      DATETIME      NULL,
-            ClientDiaryEntryType      NVARCHAR(255) NULL,
-            ClientDiaryEntryText      NVARCHAR(MAX) NULL,
-            ClientDiaryReminded       NVARCHAR(1)   NULL,
-            ClientDiaryReviewDate     DATETIME      NULL,
-            ClientDiaryAction         NVARCHAR(255) NULL,
-            ClientDiaryActionDate     DATETIME      NULL,
-            ClientDiaryReviewDoneDate DATETIME      NULL,
-            CreatedAtUTC              datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientDiary_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
-            UpdatedAtUTC              datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientDiary_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
-            CONSTRAINT PK_tbl_ClientDiary PRIMARY KEY (ClientReference, ClientDiaryReference)
+            Client_UUID                 VARCHAR(20)    NOT NULL,
+            UUID                        VARCHAR(20)    NOT NULL,
+            Client_Diary_Entry_Date     DATETIME       NULL,
+            Client_Diary_Entry_Type     NVARCHAR(255)  NULL,
+            Client_Diary_Entry_Text     NVARCHAR(MAX)  NULL,
+            Client_Diary_Reminded       NVARCHAR(1)    NULL,
+            Client_Diary_Review_Date    DATETIME       NULL,
+            Client_Diary_Action         NVARCHAR(255)  NULL,
+            Client_Diary_Action_Date    DATETIME       NULL,
+            Client_Diary_Review_Done_Date DATETIME     NULL,
+            CreatedAtUTC                datetime2(3)   NOT NULL CONSTRAINT DF_tbl_ClientDiary_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
+            UpdatedAtUTC                datetime2(3)   NOT NULL CONSTRAINT DF_tbl_ClientDiary_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT PK_tbl_ClientDiary PRIMARY KEY (Client_UUID, UUID)
         );
 
-        -- Baseline load
-        INSERT INTO dbo.tbl_ClientDiary (
-            ClientReference, ClientDiaryReference, ClientDiaryEntryDate, ClientDiaryEntryType,
-            ClientDiaryEntryText, ClientDiaryReminded, ClientDiaryReviewDate,
-            ClientDiaryAction, ClientDiaryActionDate, ClientDiaryReviewDoneDate,
-            CreatedAtUTC, UpdatedAtUTC
-        )
-        SELECT 
-            CDY.CLIENT_REF,
-            CDY.CL_DY_REF,
-            CDY.ENTRY_DATE,
-            CET.DESCRIPTION,
-            CDY.ENTRY_TEXT,
-            CDY.REMINDED,
-            CDY.REVIEW_DATE,
-            CDY.ACTION,
-            CDY.ACTIONDT,
-            CDY.REVDONE_DT,
-            @RunStartedAt,         -- CreatedAtUTC
-            @RunStartedAt          -- UpdatedAtUTC
-        FROM dbo.CLIENT_DY AS CDY WITH (NOLOCK)
-        INNER JOIN dbo.CLIENT AS C WITH (NOLOCK)
-            ON C.CLIENT_REF = CDY.CLIENT_REF
-        LEFT JOIN  dbo.CHSYSDEC AS CET WITH (NOLOCK)
-            ON CET.DECODE_REF = CDY.ENTRY_TYPE
-        WHERE C.RECTYPE NOT IN ('S','R');
+        /* Baseline load (dynamic SQL to avoid column-binding issues) */
+        DECLARE @sql nvarchar(max) = N'
+INSERT INTO dbo.tbl_ClientDiary (
+    Client_UUID, UUID, Client_Diary_Entry_Date, Client_Diary_Entry_Type,
+    Client_Diary_Entry_Text, Client_Diary_Reminded, Client_Diary_Review_Date,
+    Client_Diary_Action, Client_Diary_Action_Date, Client_Diary_Review_Done_Date,
+    CreatedAtUTC, UpdatedAtUTC
+)
+SELECT 
+    CAST(CDY.CLIENT_REF AS varchar(20))   AS Client_UUID,
+    CAST(CDY.CL_DY_REF  AS varchar(20))   AS UUID,
+    CDY.ENTRY_DATE                         AS Client_Diary_Entry_Date,
+    CET.DESCRIPTION                        AS Client_Diary_Entry_Type,
+    CDY.ENTRY_TEXT                         AS Client_Diary_Entry_Text,
+    CDY.REMINDED                           AS Client_Diary_Reminded,
+    CDY.REVIEW_DATE                        AS Client_Diary_Review_Date,
+    CDY.[ACTION]                           AS Client_Diary_Action,
+    CDY.ACTIONDT                           AS Client_Diary_Action_Date,
+    CDY.REVDONE_DT                         AS Client_Diary_Review_Done_Date,
+    @RunStartedAt                          AS CreatedAtUTC,
+    @RunStartedAt                          AS UpdatedAtUTC
+FROM dbo.CLIENT_DY AS CDY WITH (NOLOCK)
+JOIN dbo.CLIENT AS C WITH (NOLOCK)
+  ON C.CLIENT_REF = CDY.CLIENT_REF
+LEFT JOIN dbo.CHSYSDEC AS CET WITH (NOLOCK)
+  ON CET.DECODE_REF = CDY.ENTRY_TYPE
+WHERE C.RECTYPE NOT IN (''S'',''R'');';
+
+        DECLARE @params nvarchar(200) = N'@RunStartedAt datetime2(3)';
+        EXEC sp_executesql @sql, @params, @RunStartedAt=@RunStartedAt;
 
         DECLARE @Inserted int = @@ROWCOUNT;
 
-        -- Indexes
+        -- Indexes (names aligned with YOUR columns)
         CREATE NONCLUSTERED INDEX IX_tbl_ClientDiary_Client
-            ON dbo.tbl_ClientDiary (ClientReference) INCLUDE (ClientDiaryEntryDate);
+            ON dbo.tbl_ClientDiary (Client_UUID) INCLUDE (Client_Diary_Entry_Date);
+
         CREATE NONCLUSTERED INDEX IX_tbl_ClientDiary_EntryDate
-            ON dbo.tbl_ClientDiary (ClientDiaryEntryDate);
+            ON dbo.tbl_ClientDiary (Client_Diary_Entry_Date);
+
         CREATE NONCLUSTERED INDEX IX_tbl_ClientDiary_EntryType
-            ON dbo.tbl_ClientDiary (ClientDiaryEntryType);
+            ON dbo.tbl_ClientDiary (Client_Diary_Entry_Type);
 
         -- Build initial line
         DECLARE @EndInitialUTC datetime2(3) = SYSUTCDATETIME();
