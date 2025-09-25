@@ -1,12 +1,12 @@
-USE [DOM_LIVE]
+USE [DOM_LIVE];
 GO
-SET ANSI_NULLS ON
+SET ANSI_NULLS ON;
 GO
-SET QUOTED_IDENTIFIER ON
+SET QUOTED_IDENTIFIER ON;
 GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_Sync_Branch_Initial
-    @Summary NVARCHAR(4000) = NULL OUTPUT   -- human-readable result
+    @Summary NVARCHAR(4000) = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -39,7 +39,6 @@ BEGIN
         -- Preconditions
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
             RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
-
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.GLOB_SITE'))
             RAISERROR('Change Tracking is not enabled on dbo.GLOB_SITE.', 16, 1);
 
@@ -66,66 +65,73 @@ BEGIN
             INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion, LastSyncTime)
             VALUES (@Process, @BaselineFrom, SYSUTCDATETIME());
 
-        -- Recreate target with the SAME schema your incremental expects
+        -- Recreate target with the schema your incremental expects
         IF OBJECT_ID('dbo.tbl_Branch','U') IS NOT NULL
             DROP TABLE dbo.tbl_Branch;
 
         CREATE TABLE dbo.tbl_Branch
         (
-            BranchUID      VARCHAR(42)    NOT NULL,
-            BranchName     NVARCHAR(100)  NOT NULL,
-            Brand          NVARCHAR(100)  NULL,
-            Active         NVARCHAR(20)   NULL,
-            EarlyPayRate   DECIMAL(10,2)  NULL,
-            OldBranchUID   VARCHAR(20)    NULL,
-            CreatedAtUTC   datetime2(3)   NOT NULL CONSTRAINT DF_tbl_Branch_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
-            UpdatedAtUTC   datetime2(3)   NOT NULL CONSTRAINT DF_tbl_Branch_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
-            CONSTRAINT PK_tbl_Branch PRIMARY KEY CLUSTERED (BranchUID)
+            UUID               VARCHAR(42)    NOT NULL,
+            Branch_Name        NVARCHAR(100)  NOT NULL,
+            Brand              NVARCHAR(100)  NULL,
+            Active             NVARCHAR(20)   NULL,
+            Early_Pay_Rate     DECIMAL(10,2)  NULL,
+            Old_Branch_UUID    VARCHAR(20)    NULL,
+            CreatedAtUTC       datetime2(3)   NOT NULL CONSTRAINT DF_tbl_Branch_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
+            UpdatedAtUTC       datetime2(3)   NOT NULL CONSTRAINT DF_tbl_Branch_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT PK_tbl_Branch PRIMARY KEY CLUSTERED (UUID)
         );
 
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName         ON dbo.tbl_Branch (BranchName);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName         ON dbo.tbl_Branch (Branch_Name);
         CREATE NONCLUSTERED INDEX IX_tbl_Branch_Brand              ON dbo.tbl_Branch (Brand);
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName_Brand   ON dbo.tbl_Branch (BranchName, Brand);
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_OldBranchUID       ON dbo.tbl_Branch (OldBranchUID);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName_Brand   ON dbo.tbl_Branch (Branch_Name, Brand);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_OldBranchUID       ON dbo.tbl_Branch (Old_Branch_UUID);
 
-        ;WITH Base AS
-        (
-            SELECT
-                BranchName = CASE
-                                WHEN gs.GS_REF='1970000043' THEN N'Southampton'      -- special-case mapping
-                                WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                                ELSE gs.NAME
-                             END,
-                Brand        = CAST(gs.VATREG   AS NVARCHAR(100)),
-                Active       = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
-                EarlyPayRate = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
-                OldBranchUID = CAST(gs.GS_REF   AS VARCHAR(20)),
-                BranchUID    = CAST(LOWER(master.dbo.fn_varbintohexstr(
-                                   HASHBYTES('SHA1',
-                                       CASE
-                                           WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-                                           WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                                           ELSE gs.NAME
-                                       END))) AS VARCHAR(42))
-            FROM dbo.GLOB_SITE gs
-            LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep
-                   ON ep.Branch = CASE
-                                      WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-                                      WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                                      ELSE gs.NAME
-                                  END
-        )
-        INSERT INTO dbo.tbl_Branch
-        (
-            BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID, CreatedAtUTC, UpdatedAtUTC
-        )
-        SELECT
-            BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID, @RunStartedAt, @RunStartedAt
-        FROM Base;
+        /* =========
+           Baseline insert via dynamic SQL to avoid compile-time binding to any pre-existing table shape
+           ========= */
+        DECLARE @sql nvarchar(max) = N'
+;WITH Base AS
+(
+    SELECT
+        Branch_Name = CASE
+                          WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
+                          WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
+                          ELSE gs.NAME
+                      END,
+        Brand           = CAST(gs.VATREG   AS NVARCHAR(100)),
+        Active          = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
+        Early_Pay_Rate  = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
+        Old_Branch_UUID = CAST(gs.GS_REF   AS VARCHAR(20)),
+        UUID = CAST(LOWER(master.dbo.fn_varbintohexstr(
+                    HASHBYTES(''SHA1'',
+                        CASE
+                            WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
+                            WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
+                            ELSE gs.NAME
+                        END))) AS VARCHAR(42))
+    FROM dbo.GLOB_SITE gs
+    LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep
+           ON ep.Branch = CASE
+                              WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
+                              WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
+                              ELSE gs.NAME
+                          END
+)
+INSERT INTO dbo.tbl_Branch
+(
+    UUID, Branch_Name, Brand, Active, Early_Pay_Rate, Old_Branch_UUID, CreatedAtUTC, UpdatedAtUTC
+)
+SELECT
+    UUID, Branch_Name, Brand, Active, Early_Pay_Rate, Old_Branch_UUID, @RunStartedAt, @RunStartedAt
+FROM Base;
+';
+        DECLARE @params nvarchar(200) = N'@RunStartedAt datetime2(3)';
+        EXEC sp_executesql @sql, @params, @RunStartedAt=@RunStartedAt;
 
         DECLARE @BaselineInserted int = @@ROWCOUNT;
 
-        -- Optionally trigger incremental quietly (kept from prior design)
+        -- Optionally trigger incremental quietly
         IF OBJECT_ID(N'dbo.usp_Sync_Branch_Incremental', N'P') IS NOT NULL
         BEGIN
             DECLARE @rc int = 0;
