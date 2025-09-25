@@ -277,7 +277,7 @@ BEGIN
                     tgt.UpdatedAtUTC        = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (
-                    UUID, DOB, Age, Code, Gender,
+                    UUID, DOB, Code, Gender,
                     Forenames, Surname, Telephone_Number, Payroll_Number, Email,
                     Ethnicity, Religion, Job_Title, Salaried, Payroll_Schedule, Driver,
                     First_Line_Address, Second_Line_Address, Third_Line_Address, Fourth_Line_Address,
