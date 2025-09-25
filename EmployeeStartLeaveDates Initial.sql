@@ -64,68 +64,63 @@ BEGIN
             DROP TABLE dbo.tbl_EmployeeStartLeaveDates;
 
         CREATE TABLE dbo.tbl_EmployeeStartLeaveDates (
-            UpdatedGlobalStartDate DATE          NULL,
-            GlobalStartDate        DATE          NULL,
-            GlobalEndDate          DATE          NULL,
-            GlobalStatus           VARCHAR(50)   NULL,
-            EmployeeReference      VARCHAR(50)   NOT NULL,
-            UpdatedLeaveDate       DATE          NULL,
-            NumberOfBranches       INT           NULL,
-            CreatedAtUTC           datetime2(3)  NOT NULL CONSTRAINT DF_tbl_EmpSLD_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
-            UpdatedAtUTC           datetime2(3)  NOT NULL CONSTRAINT DF_tbl_EmpSLD_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
-            CONSTRAINT PK_tbl_EmployeeStartLeaveDates PRIMARY KEY CLUSTERED (EmployeeReference)
+            [Start_Date]     date         NULL,
+            [End_Date]       date         NULL,
+            [Status]         varchar(50)  NULL,
+            [Employee_UUID]  varchar(50)  NOT NULL,
+            CreatedAtUTC     datetime2(3) NOT NULL CONSTRAINT DF_tbl_EmpSLD_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
+            UpdatedAtUTC     datetime2(3) NOT NULL CONSTRAINT DF_tbl_EmpSLD_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT PK_tbl_EmployeeStartLeaveDates PRIMARY KEY CLUSTERED (Employee_UUID)
         );
 
-        /* 5) Baseline load (same logic as incremental’s Agg/Final) */
-        ;WITH Agg AS
+        /* 5) Baseline load (aggregate over tbl_EmployeeBranch) */
+        ;WITH base AS
         (
             SELECT
-                eb.EmployeeReference,
-                MIN(eb.StartDate) AS MinStartDate,
-                MAX(eb.EndDate)   AS MaxEndDate,
-                SUM(CASE WHEN eb.EndDate IS NULL THEN 1 ELSE 0 END) AS OpenRows,
+                eb.Employee_UUID,
+                MIN(CAST(eb.Start_Date AS date)) AS MinStartDate,
+                MAX(CAST(eb.End_Date   AS date)) AS MaxEndDate,
+                SUM(CASE WHEN eb.End_Date IS NULL THEN 1 ELSE 0 END) AS OpenRows,
+                -- rank “Active” highest, then “Temporarily Inactive”, else 0
                 MAX(CASE WHEN eb.[Status] = 'Active' THEN 2
                          WHEN eb.[Status] = 'Temporarily Inactive' THEN 1
                          ELSE 0 END) AS StatusRank,
-                COUNT(DISTINCT eb.BranchReference) AS BranchCount
+                COUNT(DISTINCT eb.Branch_UUID) AS BranchCount
             FROM dbo.tbl_EmployeeBranch eb
-            GROUP BY eb.EmployeeReference
+            GROUP BY eb.Employee_UUID
         ),
         Final AS
         (
             SELECT
-                UpdatedGlobalStartDate = MinStartDate,
-                GlobalStartDate        = ISNULL(MinStartDate, CAST('1998-01-01' AS date)),
-                GlobalEndDate          = CASE WHEN OpenRows > 0 THEN NULL ELSE MaxEndDate END,
-                GlobalStatus           = CASE WHEN OpenRows > 0
-                                               THEN CASE WHEN StatusRank = 2 THEN 'Active'
-                                                         WHEN StatusRank = 1 THEN 'Temporarily Inactive'
-                                                    END
-                                               ELSE 'Permanently Inactive' END,
-                EmployeeReference      = CAST(a.EmployeeReference AS varchar(50)),
-                UpdatedLeaveDate       = ISNULL(CASE WHEN OpenRows > 0 THEN NULL ELSE MaxEndDate END,
-                                                 CAST(@RunStartedAt AS date)),
-                NumberOfBranches       = ISNULL(a.BranchCount, 0)
-            FROM Agg a
+                [Start_Date]    = ISNULL(MinStartDate, CAST('1998-01-01' AS date)),
+                [End_Date]      = CASE WHEN OpenRows > 0 THEN NULL ELSE MaxEndDate END,
+                [Status]        = CASE 
+                                    WHEN OpenRows > 0 THEN 
+                                        CASE WHEN StatusRank = 2 THEN 'Active'
+                                             WHEN StatusRank = 1 THEN 'Temporarily Inactive'
+                                             ELSE 'Unknown'
+                                        END
+                                    ELSE 'Permanently Inactive'
+                                  END,
+                [Employee_UUID] = CAST(b.Employee_UUID AS varchar(50))
+            FROM base b
         )
         INSERT dbo.tbl_EmployeeStartLeaveDates
         (
-            UpdatedGlobalStartDate, GlobalStartDate, GlobalEndDate, GlobalStatus,
-            EmployeeReference, UpdatedLeaveDate, NumberOfBranches,
-            CreatedAtUTC, UpdatedAtUTC
+            [Start_Date], [End_Date], [Status],
+            [Employee_UUID], CreatedAtUTC, UpdatedAtUTC
         )
         SELECT
-            f.UpdatedGlobalStartDate, f.GlobalStartDate, f.GlobalEndDate, f.GlobalStatus,
-            f.EmployeeReference, f.UpdatedLeaveDate, f.NumberOfBranches,
-            @RunStartedAt, @RunStartedAt
+            f.[Start_Date], f.[End_Date], f.[Status],
+            f.[Employee_UUID], @RunStartedAt, @RunStartedAt
         FROM Final f;
 
         DECLARE @Inserted int = @@ROWCOUNT;
 
         /* 6) Helpful indexes */
-        CREATE NONCLUSTERED INDEX IX_EmpSLD_Status ON dbo.tbl_EmployeeStartLeaveDates (GlobalStatus);
-        CREATE NONCLUSTERED INDEX IX_EmpSLD_GlobalStart ON dbo.tbl_EmployeeStartLeaveDates (GlobalStartDate);
-        CREATE NONCLUSTERED INDEX IX_EmpSLD_GlobalEnd   ON dbo.tbl_EmployeeStartLeaveDates (GlobalEndDate);
+        CREATE NONCLUSTERED INDEX IX_EmpSLD_Status     ON dbo.tbl_EmployeeStartLeaveDates ([Status]);
+        CREATE NONCLUSTERED INDEX IX_EmpSLD_StartDate  ON dbo.tbl_EmployeeStartLeaveDates ([Start_Date]);
+        CREATE NONCLUSTERED INDEX IX_EmpSLD_EndDate    ON dbo.tbl_EmployeeStartLeaveDates ([End_Date]);
 
         /* 7) Summaries + quiet incremental sweep */
         DECLARE @EndInitialUTC datetime2(3) = SYSUTCDATETIME();

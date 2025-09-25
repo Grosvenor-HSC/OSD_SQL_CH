@@ -6,7 +6,7 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_Sync_EmployeeStartLeaveDates_Incremental
-    @ChunkSize        int  = 100000,  -- tune (50k–200k typical)
+    @ChunkSize        int  = 100000,
     @LockTimeoutMs    int  = 60000,
     @UseAppLock       bit  = 1,
     @EmitInfo         bit  = 1,                       -- 0=quiet
@@ -35,8 +35,7 @@ BEGIN
     BEGIN
         EXEC @lockResult = sys.sp_getapplock
             @Resource=@LockResource, @LockMode='Exclusive',
-            @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal,
-            @LockTimeout=@LockTimeoutMs;
+            @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal, @LockTimeout=@LockTimeoutMs;
 
         IF @lockResult NOT IN (0,1)
         BEGIN
@@ -55,17 +54,15 @@ BEGIN
             IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at DB level.', 16, 1);
             SET @Summary = N'EmployeeStartLeaveDates incremental failed: CT not enabled at DB level.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -100;
+            GOTO FinallyRelease;
         END
 
         IF OBJECT_ID('dbo.tbl_EmployeeStartLeaveDates','U') IS NULL
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Target table dbo.tbl_EmployeeStartLeaveDates does not exist. Run the baseline first.', 16, 1);
+            IF @EmitInfo=1 RAISERROR('Target dbo.tbl_EmployeeStartLeaveDates is missing. Run the initial.', 16, 1);
             SET @Summary = N'EmployeeStartLeaveDates incremental failed: target missing (run initial).';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -110;
+            GOTO FinallyRelease;
         END
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.tbl_EmployeeBranch'))
@@ -73,10 +70,10 @@ BEGIN
             IF @EmitInfo=1 RAISERROR('CT not enabled on dbo.tbl_EmployeeBranch.', 16, 1);
             SET @Summary = N'EmployeeStartLeaveDates incremental failed: CT not enabled on tbl_EmployeeBranch.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -120;
+            GOTO FinallyRelease;
         END
 
+        -- Watermark table
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -97,82 +94,79 @@ BEGIN
 
         IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) is older than CT min valid (%I64d) on tbl_EmployeeBranch. Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
+            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d) on tbl_EmployeeBranch. Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
             SET @Summary = CONCAT(N'EmployeeStartLeaveDates incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N'.');
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -200;
+            GOTO FinallyRelease;
         END
 
         DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
 
         IF @EmitInfo=1
         BEGIN
-            RAISERROR('EmployeeStartLeaveDates CT incremental window:', 0, 1) WITH NOWAIT;
+            RAISERROR('EmployeeStartLeaveDates CT window:', 0, 1) WITH NOWAIT;
             RAISERROR('  From = %I64d', 0, 1, @LastSyncVersion) WITH NOWAIT;
             RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
         END
 
-        /* 2) Hash->employee key map (for delete resolution) */
+        /* 2) Maintain a tiny PK→employee map so we can resolve deletes */
         IF OBJECT_ID('dbo.tbl_EmployeeBranch_KeyMap','U') IS NULL
         BEGIN
             CREATE TABLE dbo.tbl_EmployeeBranch_KeyMap
             (
-              EmpBranchHash     varbinary(32) NOT NULL PRIMARY KEY,
-              EmployeeReference int           NOT NULL,
-              BranchReference   nvarchar(55)  NULL,
-              UpdatedAtUTC      datetime2(3)  NOT NULL DEFAULT SYSUTCDATETIME()
+              UUID           varbinary(32) NOT NULL PRIMARY KEY,  -- matches tbl_EmployeeBranch.UUID
+              Employee_UUID  varchar(50)   NOT NULL,
+              Branch_UUID    varchar(55)   NULL,
+              UpdatedAtUTC   datetime2(3)  NOT NULL DEFAULT SYSUTCDATETIME()
             );
 
-            INSERT INTO dbo.tbl_EmployeeBranch_KeyMap (EmpBranchHash, EmployeeReference, BranchReference)
-            SELECT EmpBranchHash, EmployeeReference, BranchReference
+            INSERT INTO dbo.tbl_EmployeeBranch_KeyMap (UUID, Employee_UUID, Branch_UUID)
+            SELECT UUID, Employee_UUID, Branch_UUID
             FROM dbo.tbl_EmployeeBranch;
         END
         ELSE
         BEGIN
             MERGE dbo.tbl_EmployeeBranch_KeyMap AS m
-            USING (SELECT EmpBranchHash, EmployeeReference, BranchReference FROM dbo.tbl_EmployeeBranch) s
-               ON m.EmpBranchHash = s.EmpBranchHash
-            WHEN MATCHED AND (m.EmployeeReference <> s.EmployeeReference OR ISNULL(m.BranchReference,'') <> ISNULL(s.BranchReference,'')) THEN
-                UPDATE SET m.EmployeeReference = s.EmployeeReference,
-                           m.BranchReference   = s.BranchReference,
-                           m.UpdatedAtUTC      = SYSUTCDATETIME()
+            USING (SELECT UUID, Employee_UUID, Branch_UUID FROM dbo.tbl_EmployeeBranch) s
+              ON m.UUID = s.UUID
+            WHEN MATCHED AND (m.Employee_UUID <> s.Employee_UUID OR ISNULL(m.Branch_UUID,'') <> ISNULL(s.Branch_UUID,'')) THEN
+              UPDATE SET m.Employee_UUID = s.Employee_UUID,
+                         m.Branch_UUID   = s.Branch_UUID,
+                         m.UpdatedAtUTC  = SYSUTCDATETIME()
             WHEN NOT MATCHED BY TARGET THEN
-                INSERT (EmpBranchHash, EmployeeReference, BranchReference)
-                VALUES (s.EmpBranchHash, s.EmployeeReference, s.BranchReference);
+              INSERT (UUID, Employee_UUID, Branch_UUID)
+              VALUES (s.UUID, s.Employee_UUID, s.Branch_UUID);
         END
 
-        /* 3) Build changed EmployeeReference set */
+        /* 3) Build changed Employee_UUID set */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (EmployeeReference int NOT NULL PRIMARY KEY);
+        CREATE TABLE #Changed (Employee_UUID varchar(50) NOT NULL PRIMARY KEY);
 
-        -- I/U from tbl_EmployeeBranch
-        INSERT INTO #Changed(EmployeeReference)
-        SELECT DISTINCT t.EmployeeReference
+        -- Inserts/Updates: join CT to current rows to get Employee_UUID
+        INSERT INTO #Changed(Employee_UUID)
+        SELECT DISTINCT eb.Employee_UUID
         FROM CHANGETABLE(CHANGES dbo.tbl_EmployeeBranch, @LastSyncVersion) ct
-        JOIN dbo.tbl_EmployeeBranch t
-          ON t.EmpBranchHash = ct.EmpBranchHash
+        JOIN dbo.tbl_EmployeeBranch eb ON eb.UUID = ct.UUID
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
           AND ct.SYS_CHANGE_OPERATION IN ('I','U');
 
-        -- D from tbl_EmployeeBranch using key map
-        INSERT INTO #Changed(EmployeeReference)
-        SELECT DISTINCT m.EmployeeReference
+        -- Deletes: resolve Employee_UUID via key-map
+        INSERT INTO #Changed(Employee_UUID)
+        SELECT DISTINCT km.Employee_UUID
         FROM CHANGETABLE(CHANGES dbo.tbl_EmployeeBranch, @LastSyncVersion) ct
-        JOIN dbo.tbl_EmployeeBranch_KeyMap m
-          ON m.EmpBranchHash = ct.EmpBranchHash
+        JOIN dbo.tbl_EmployeeBranch_KeyMap km ON km.UUID = ct.UUID
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
           AND ct.SYS_CHANGE_OPERATION = 'D'
-          AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeReference = m.EmployeeReference);
+          AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.Employee_UUID = km.Employee_UUID);
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
-        IF @EmitInfo=1 RAISERROR('Changed employees to process: %d', 0, 1, @ToProcess) WITH NOWAIT;
+        IF @EmitInfo=1 RAISERROR('Changed employees to (re)aggregate: %d', 0, 1, @ToProcess) WITH NOWAIT;
 
         IF @ToProcess = 0
         BEGIN
             UPDATE dbo.CT_Watermark
-              SET LastSyncVersion = @ToVersion, LastSyncTime = SYSUTCDATETIME()
-            WHERE ProcessName = @Process;
+              SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
+            WHERE ProcessName=@Process;
 
             SET @EndUTC = SYSUTCDATETIME();
             SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
@@ -184,23 +178,21 @@ BEGIN
                 CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
             );
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN 0;
+            GOTO FinallyRelease;
         END
 
-        /* 4) Chunked UPSERT */
+        /* 4) Chunked UPSERT into tbl_EmployeeStartLeaveDates */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next (EmployeeReference int NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next (Employee_UUID varchar(50) NOT NULL PRIMARY KEY);
 
-            INSERT INTO #Next(EmployeeReference)
-            SELECT TOP (@ChunkSize) EmployeeReference
+            INSERT INTO #Next(Employee_UUID)
+            SELECT TOP (@ChunkSize) Employee_UUID
             FROM #Changed
-            ORDER BY EmployeeReference;
+            ORDER BY Employee_UUID;
 
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
@@ -208,64 +200,46 @@ BEGIN
             ;WITH Agg AS
             (
                 SELECT
-                    n.EmployeeReference,
-                    MIN(eb.StartDate) AS MinStartDate,
-                    MAX(eb.EndDate)   AS MaxEndDate,
-                    SUM(CASE WHEN eb.EndDate IS NULL THEN 1 ELSE 0 END) AS OpenRows,
+                    n.Employee_UUID,
+                    MIN(CAST(eb.Start_Date AS date)) AS MinStartDate,
+                    MAX(CAST(eb.End_Date   AS date)) AS MaxEndDate,
+                    SUM(CASE WHEN eb.End_Date IS NULL THEN 1 ELSE 0 END) AS OpenRows,
                     MAX(CASE WHEN eb.[Status] = 'Active' THEN 2
                              WHEN eb.[Status] = 'Temporarily Inactive' THEN 1
-                             ELSE 0 END) AS StatusRank,
-                    COUNT(DISTINCT eb.BranchReference) AS BranchCount
+                             ELSE 0 END) AS StatusRank
                 FROM #Next n
                 LEFT JOIN dbo.tbl_EmployeeBranch eb
-                  ON eb.EmployeeReference = n.EmployeeReference
-                GROUP BY n.EmployeeReference
+                       ON eb.Employee_UUID = n.Employee_UUID
+                GROUP BY n.Employee_UUID
             ),
             Final AS
             (
                 SELECT
-                    UpdatedGlobalStartDate = MinStartDate,
-                    GlobalStartDate        = ISNULL(MinStartDate, CAST('1998-01-01' AS date)),
-                    GlobalEndDate          = CASE WHEN OpenRows > 0 THEN NULL ELSE MaxEndDate END,
-                    GlobalStatus           = CASE WHEN OpenRows > 0
-                                                   THEN CASE WHEN StatusRank = 2 THEN 'Active'
-                                                             WHEN StatusRank = 1 THEN 'Temporarily Inactive'
-                                                        END
-                                                   ELSE 'Permanently Inactive' END,
-                    EmployeeReference      = CAST(a.EmployeeReference AS varchar(50)),
-                    UpdatedLeaveDate       = ISNULL(CASE WHEN OpenRows > 0 THEN NULL ELSE MaxEndDate END,
-                                                     CAST(@RunStartedAt AS date)),
-                    NumberOfBranches       = ISNULL(a.BranchCount, 0)
+                    Employee_UUID = a.Employee_UUID,
+                    Start_Date    = ISNULL(a.MinStartDate, CAST('1998-01-01' AS date)),
+                    End_Date      = CASE WHEN a.OpenRows > 0 THEN NULL ELSE a.MaxEndDate END,
+                    [Status]      = CASE
+                                      WHEN a.OpenRows > 0 THEN
+                                        CASE WHEN a.StatusRank = 2 THEN 'Active'
+                                             WHEN a.StatusRank = 1 THEN 'Temporarily Inactive'
+                                             ELSE 'Unknown'
+                                        END
+                                      ELSE 'Permanently Inactive'
+                                    END
                 FROM Agg a
             )
             MERGE dbo.tbl_EmployeeStartLeaveDates AS tgt
-            USING (
-                SELECT
-                    UpdatedGlobalStartDate, GlobalStartDate, GlobalEndDate, GlobalStatus,
-                    EmployeeReference, UpdatedLeaveDate, NumberOfBranches
-                FROM Final
-            ) AS src
-                ON tgt.EmployeeReference = src.EmployeeReference
+            USING Final AS src
+               ON tgt.Employee_UUID = src.Employee_UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.UpdatedGlobalStartDate = src.UpdatedGlobalStartDate,
-                    tgt.GlobalStartDate        = src.GlobalStartDate,
-                    tgt.GlobalEndDate          = src.GlobalEndDate,
-                    tgt.GlobalStatus           = src.GlobalStatus,
-                    tgt.UpdatedLeaveDate       = src.UpdatedLeaveDate,
-                    tgt.NumberOfBranches       = src.NumberOfBranches,
-                    tgt.UpdatedAtUTC           = @RunStartedAt
+                    tgt.Start_Date  = src.Start_Date,
+                    tgt.End_Date    = src.End_Date,
+                    tgt.[Status]    = src.[Status],
+                    tgt.UpdatedAtUTC= @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
-                INSERT (
-                    UpdatedGlobalStartDate, GlobalStartDate, GlobalEndDate, GlobalStatus,
-                    EmployeeReference, UpdatedLeaveDate, NumberOfBranches,
-                    CreatedAtUTC, UpdatedAtUTC
-                )
-                VALUES (
-                    src.UpdatedGlobalStartDate, src.GlobalStartDate, src.GlobalEndDate, src.GlobalStatus,
-                    src.EmployeeReference, src.UpdatedLeaveDate, src.NumberOfBranches,
-                    @RunStartedAt, @RunStartedAt
-                )
+                INSERT (Start_Date, End_Date, [Status], Employee_UUID, CreatedAtUTC, UpdatedAtUTC)
+                VALUES (src.Start_Date, src.End_Date, src.[Status], src.Employee_UUID, @RunStartedAt, @RunStartedAt)
             OUTPUT $action INTO #ActLog(Action);
 
             DECLARE @i int=0, @u int=0;
@@ -278,12 +252,12 @@ BEGIN
             SET @TotalUpdated  += ISNULL(@u,0);
 
             IF @EmitInfo=1
-                RAISERROR('EmployeeStartLeaveDates chunk upserted: inserted=%d updated=%d (running %d/%d)',
+                RAISERROR('EmployeeStartLeaveDates chunk: inserted=%d updated=%d (running %d/%d)',
                           0,1,@i,@u,@TotalInserted,@TotalUpdated) WITH NOWAIT;
 
             DELETE c
             FROM #Changed c
-            JOIN #Next n ON n.EmployeeReference = c.EmployeeReference;
+            JOIN #Next n ON n.Employee_UUID = c.Employee_UUID;
         END
 
         /* 5) Advance watermark + summary */
@@ -307,14 +281,15 @@ BEGIN
         IF @EmitInfo=1 RAISERROR('EmployeeStartLeaveDates incremental sync complete.', 0, 1) WITH NOWAIT;
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
+FinallyRelease:
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
         RETURN 0;
     END TRY
     BEGIN CATCH
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-        DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
-        DECLARE @num int = ERROR_NUMBER(), @sev int = ERROR_SEVERITY(), @st int = ERROR_STATE(), @lin int = ERROR_LINE(), @proc sysname = ERROR_PROCEDURE();
-        DECLARE @procName sysname = COALESCE(@proc, N'<adhoc>');
+        DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
+        DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
+        DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
         IF @EmitInfo=1 RAISERROR('usp_Sync_EmployeeStartLeaveDates_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
                                  16,1,@num,@sev,@st,@procName,@lin,@msg);
         SET @Summary = CONCAT(N'EmployeeStartLeaveDates incremental failed: ', @msg);
