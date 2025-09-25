@@ -69,11 +69,6 @@ BEGIN
             Client_Diary_Entry_Date     DATETIME       NULL,
             Client_Diary_Entry_Type     NVARCHAR(255)  NULL,
             Client_Diary_Entry_Text     NVARCHAR(MAX)  NULL,
-            Client_Diary_Reminded       NVARCHAR(1)    NULL,
-            Client_Diary_Review_Date    DATETIME       NULL,
-            Client_Diary_Action         NVARCHAR(255)  NULL,
-            Client_Diary_Action_Date    DATETIME       NULL,
-            Client_Diary_Review_Done_Date DATETIME     NULL,
             CreatedAtUTC                datetime2(3)   NOT NULL CONSTRAINT DF_tbl_ClientDiary_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
             UpdatedAtUTC                datetime2(3)   NOT NULL CONSTRAINT DF_tbl_ClientDiary_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
             CONSTRAINT PK_tbl_ClientDiary PRIMARY KEY (Client_UUID, UUID)
@@ -83,9 +78,7 @@ BEGIN
         DECLARE @sql nvarchar(max) = N'
 INSERT INTO dbo.tbl_ClientDiary (
     Client_UUID, UUID, Client_Diary_Entry_Date, Client_Diary_Entry_Type,
-    Client_Diary_Entry_Text, Client_Diary_Reminded, Client_Diary_Review_Date,
-    Client_Diary_Action, Client_Diary_Action_Date, Client_Diary_Review_Done_Date,
-    CreatedAtUTC, UpdatedAtUTC
+    Client_Diary_Entry_Text, CreatedAtUTC, UpdatedAtUTC
 )
 SELECT 
     CAST(CDY.CLIENT_REF AS varchar(20))   AS Client_UUID,
@@ -93,11 +86,6 @@ SELECT
     CDY.ENTRY_DATE                         AS Client_Diary_Entry_Date,
     CET.DESCRIPTION                        AS Client_Diary_Entry_Type,
     CDY.ENTRY_TEXT                         AS Client_Diary_Entry_Text,
-    CDY.REMINDED                           AS Client_Diary_Reminded,
-    CDY.REVIEW_DATE                        AS Client_Diary_Review_Date,
-    CDY.[ACTION]                           AS Client_Diary_Action,
-    CDY.ACTIONDT                           AS Client_Diary_Action_Date,
-    CDY.REVDONE_DT                         AS Client_Diary_Review_Done_Date,
     @RunStartedAt                          AS CreatedAtUTC,
     @RunStartedAt                          AS UpdatedAtUTC
 FROM dbo.CLIENT_DY AS CDY WITH (NOLOCK)
