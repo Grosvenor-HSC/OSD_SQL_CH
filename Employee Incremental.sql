@@ -23,7 +23,7 @@ BEGIN
     DECLARE @EndUTC        datetime2(3);
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
-    DECLARE @ret           int = 0;      -- final return code
+    DECLARE @ret           int = 0;
 
     /* 0) Concurrency guard */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:Employees';
@@ -61,7 +61,6 @@ BEGIN
             SET @ret = -100; GOTO FinallyRelease;
         END
 
-        -- FIX: removed extra closing parenthesis here ↓
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.EMPLOYEE'))
         BEGIN
             IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.EMPLOYEE.',16,1);
@@ -70,12 +69,11 @@ BEGIN
             SET @ret = -210; GOTO FinallyRelease;
         END
 
-        -- Optional CT sources
         DECLARE @CT_CONTACT_DT bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CONTACT_DT')) THEN 1 ELSE 0 END;
         DECLARE @CT_CONTACT_HD bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CONTACT_HD')) THEN 1 ELSE 0 END;
         DECLARE @CT_CHSYSDEC   bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC'))   THEN 1 ELSE 0 END;
 
-        -- Watermark table
+        -- Watermark
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -91,7 +89,6 @@ BEGIN
         DECLARE @LastSyncVersion bigint =
             (SELECT LastSyncVersion FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process);
 
-        -- Min valid across the tables queried via CHANGETABLE
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
@@ -106,7 +103,7 @@ BEGIN
 
         IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) is older than CT min valid version (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
+            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
             SET @Summary = CONCAT(N'Employees incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N' (re-baseline).');
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             SET @ret = -200; GOTO FinallyRelease;
@@ -121,49 +118,49 @@ BEGIN
             RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
         END
 
-        /* 2) Build changed EmployeeReference set */
+        /* 2) Build changed set (keys = EMP_REF) */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (EmployeeReference int NOT NULL PRIMARY KEY);
+        CREATE TABLE #Changed (UUID int NOT NULL PRIMARY KEY);  -- matches tbl_Employees primary key
 
         -- EMPLOYEE (I/U)
-        INSERT INTO #Changed(EmployeeReference)
+        INSERT INTO #Changed(UUID)
         SELECT DISTINCT e.EMP_REF
         FROM CHANGETABLE(CHANGES dbo.EMPLOYEE, @LastSyncVersion) ct
         JOIN dbo.EMPLOYEE e ON e.EMP_REF = ct.EMP_REF
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
           AND ct.SYS_CHANGE_OPERATION IN ('I','U');
 
-        -- CONTACT_DT (optional)
+        -- CONTACT_DT (opt)
         IF @CT_CONTACT_DT = 1
         BEGIN
-            INSERT INTO #Changed(EmployeeReference)
+            INSERT INTO #Changed(UUID)
             SELECT DISTINCT e.EMP_REF
             FROM CHANGETABLE(CHANGES dbo.CONTACT_DT, @LastSyncVersion) x
             JOIN dbo.EMPLOYEE e ON e.CNTA_DET_REF = x.CNTA_DET_REF
             WHERE x.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeReference = e.EMP_REF);
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = e.EMP_REF);
         END
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on CONTACT_DT; contact changes not captured.', 0, 1) WITH NOWAIT;
 
-        -- CONTACT_HD (optional)
+        -- CONTACT_HD (opt)
         IF @CT_CONTACT_HD = 1
         BEGIN
-            INSERT INTO #Changed(EmployeeReference)
+            INSERT INTO #Changed(UUID)
             SELECT DISTINCT e.EMP_REF
             FROM CHANGETABLE(CHANGES dbo.CONTACT_HD, @LastSyncVersion) h
             JOIN dbo.CONTACT_DT dt ON dt.CONTACT_REF = h.CONTACT_REF
             JOIN dbo.EMPLOYEE  e  ON e.CNTA_DET_REF  = dt.CNTA_DET_REF
             WHERE h.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeReference = e.EMP_REF);
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = e.EMP_REF);
         END
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on CONTACT_HD; header changes not captured.', 0, 1) WITH NOWAIT;
 
-        -- CHSYSDEC (optional)
+        -- CHSYSDEC (opt)
         IF @CT_CHSYSDEC = 1
         BEGIN
-            INSERT INTO #Changed(EmployeeReference)
+            INSERT INTO #Changed(UUID)
             SELECT DISTINCT e.EMP_REF
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) d
             JOIN dbo.EMPLOYEE e
@@ -173,7 +170,7 @@ BEGIN
               OR e.LOCATION_REF = d.DECODE_REF
               OR e.JOB_QUAL     = d.DECODE_REF
             WHERE d.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeReference = e.EMP_REF);
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = e.EMP_REF);
         END
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on CHSYSDEC; decoded text changes not captured.', 0, 1) WITH NOWAIT;
@@ -202,18 +199,18 @@ BEGIN
             SET @ret = 0; GOTO FinallyRelease;
         END
 
-        /* 3) Chunked MERGE into dbo.tbl_Employees */
+        /* 3) Chunked MERGE into dbo.tbl_Employees (schema aligned with Initial) */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next (EmployeeReference int NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next (UUID int NOT NULL PRIMARY KEY);
 
-            INSERT INTO #Next(EmployeeReference)
-            SELECT TOP (@ChunkSize) EmployeeReference
+            INSERT INTO #Next(UUID)
+            SELECT TOP (@ChunkSize) UUID
             FROM #Changed
-            ORDER BY EmployeeReference;
+            ORDER BY UUID;
 
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
@@ -221,122 +218,77 @@ BEGIN
             ;WITH Base AS
             (
                 SELECT
-                    E.EMP_REF                                        AS EmployeeReference,
-                    E.GS_REF                                         AS OldBranchUID,
-                    CAST(E.BIRTH_DATE AS DATE)                       AS EmployeeDateOfBirth,
-                    DATEDIFF(year, CAST(E.BIRTH_DATE AS DATE), GETDATE())
-                      - CASE WHEN DATEADD(year, DATEDIFF(year, E.BIRTH_DATE, GETDATE()), E.BIRTH_DATE) > GETDATE() THEN 1 ELSE 0 END
-                                                                AS EmployeeAge,
-                    E.EMP_CODE                                       AS EmployeeCode,
-                    CASE E.SEX WHEN 'M' THEN 'Male'
-                               WHEN 'F' THEN 'Female'
-                               WHEN 'N' THEN 'Not Applicable'
-                               ELSE 'Unknown' END                    AS EmployeeGender,
-                    CHD.FORENAMES                                    AS EmployeeForenames,
-                    CHD.SURNAME                                      AS EmployeeSurname,
-                    CHD.TEL_NO1                                      AS TelephoneNumber,
-                    E.PAYROLL_NO                                     AS PayrollNumber,
-                    CHD.EMAIL                                        AS Email,
-                    CEE.DESCRIPTION                                  AS Ethnicity,
-                    CER.DESCRIPTION                                  AS Religion,
-                    CEJT.DESCRIPTION                                 AS JobTitle,
-                    JQ.DESCRIPTION                                   AS Salaried,
-                    E.INTERFACE                                      AS Interface,
-                    E.DRIVER                                         AS Driver,
-                    CHD.ADDRESS1                                     AS FirstLineAddress,
-                    CHD.ADDRESS2                                     AS SecondLineAddress,
-                    CHD.ADDRESS3                                     AS ThirdLineAddress,
-                    CHD.ADDRESS4                                     AS FourthLineAddress,
-                    CHD.POSTCODE                                     AS Postcode,
-                    CEL.DESCRIPTION                                  AS EmployeeSubLocation
+                    UUID                = E.EMP_REF,
+                    DOB                 = CAST(E.BIRTH_DATE AS DATE),
+                    Code                = E.EMP_CODE,
+                    Gender              = CASE E.SEX WHEN 'M' THEN 'Male'
+                                                    WHEN 'F' THEN 'Female'
+                                                    WHEN 'N' THEN 'Not Applicable'
+                                                    ELSE 'Unknown' END,
+                    Forenames           = CHD.FORENAMES,
+                    Surname             = CHD.SURNAME,
+                    Telephone_Number    = CHD.TEL_NO1,
+                    Payroll_Number      = E.PAYROLL_NO,
+                    Email               = CHD.EMAIL,
+                    Ethnicity           = CEE.DESCRIPTION,
+                    Religion            = CER.DESCRIPTION,
+                    Job_Title           = CEJT.DESCRIPTION,
+                    Salaried            = JQ.DESCRIPTION,
+                    Payroll_Schedule    = E.INTERFACE,
+                    Driver              = E.DRIVER,
+                    First_Line_Address  = CHD.ADDRESS1,
+                    Second_Line_Address = CHD.ADDRESS2,
+                    Third_Line_Address  = CHD.ADDRESS3,
+                    Fourth_Line_Address = CHD.ADDRESS4,
+                    Postcode            = CHD.POSTCODE
                 FROM dbo.EMPLOYEE E
-                JOIN #Next n                 ON n.EmployeeReference = E.EMP_REF
-                LEFT JOIN dbo.CONTACT_DT CDT ON CDT.CNTA_DET_REF    = E.CNTA_DET_REF
-                LEFT JOIN dbo.CONTACT_HD CHD ON CHD.CONTACT_REF     = CDT.CONTACT_REF
-                LEFT JOIN dbo.CHSYSDEC CEE   ON E.ETHNICITY         = CEE.DECODE_REF
-                LEFT JOIN dbo.CHSYSDEC CER   ON E.RELORG_REF        = CER.DECODE_REF
-                LEFT JOIN dbo.CHSYSDEC CEJT  ON E.JOBTITLE          = CEJT.DECODE_REF
-                LEFT JOIN dbo.CHSYSDEC CEL   ON E.LOCATION_REF      = CEL.DECODE_REF
-                LEFT JOIN dbo.CHSYSDEC JQ    ON E.JOB_QUAL          = JQ.DECODE_REF
-            ),
-            WithBranch AS
-            (
-                SELECT
-                    b.EmployeeReference,
-                    BranchUID = COALESCE(bname.BranchUID, bold.BranchUID),
-                    b.EmployeeDateOfBirth, b.EmployeeAge, b.EmployeeCode, b.EmployeeGender,
-                    b.EmployeeForenames, b.EmployeeSurname, b.TelephoneNumber, b.PayrollNumber,
-                    b.Email, b.Ethnicity, b.Religion, b.JobTitle, b.Salaried, b.Interface, b.Driver,
-                    b.FirstLineAddress, b.SecondLineAddress, b.ThirdLineAddress, b.FourthLineAddress,
-                    b.Postcode, b.EmployeeSubLocation
-                FROM Base b
-                OUTER APPLY (
-                    SELECT CASE
-                             WHEN b.OldBranchUID = '1970000043' AND b.EmployeeSubLocation = 'Southampton' THEN 'Southampton'
-                             WHEN b.OldBranchUID = '1970000043' AND (b.EmployeeSubLocation <> 'Southampton' OR b.EmployeeSubLocation IS NULL) THEN 'Portsmouth'
-                             ELSE NULL
-                           END AS BranchName
-                ) pick
-                LEFT JOIN dbo.tbl_Branch AS bname  ON pick.BranchName IS NOT NULL AND bname.BranchName = pick.BranchName
-                LEFT JOIN dbo.tbl_Branch AS bold   ON pick.BranchName IS NULL    AND bold.OldBranchUID = b.OldBranchUID
+                JOIN #Next n                 ON n.UUID           = E.EMP_REF
+                LEFT JOIN dbo.CONTACT_DT CDT ON CDT.CNTA_DET_REF = E.CNTA_DET_REF
+                LEFT JOIN dbo.CONTACT_HD CHD ON CHD.CONTACT_REF  = CDT.CONTACT_REF
+                LEFT JOIN dbo.CHSYSDEC CEE   ON E.ETHNICITY      = CEE.DECODE_REF
+                LEFT JOIN dbo.CHSYSDEC CER   ON E.RELORG_REF     = CER.DECODE_REF
+                LEFT JOIN dbo.CHSYSDEC CEJT  ON E.JOBTITLE       = CEJT.DECODE_REF
+                LEFT JOIN dbo.CHSYSDEC JQ    ON E.JOB_QUAL       = JQ.DECODE_REF
             )
             MERGE dbo.tbl_Employees AS tgt
-            USING (
-                SELECT
-                    w.EmployeeReference,
-                    BranchReference = CAST(w.BranchUID AS nvarchar(55)),
-                    w.EmployeeDateOfBirth, w.EmployeeAge, w.EmployeeCode, w.EmployeeGender,
-                    w.EmployeeForenames, w.EmployeeSurname, w.TelephoneNumber, w.PayrollNumber, w.Email,
-                    w.Ethnicity, w.Religion, w.JobTitle, w.Salaried, w.Interface, w.Driver,
-                    w.FirstLineAddress, w.SecondLineAddress, w.ThirdLineAddress, w.FourthLineAddress,
-                    w.Postcode, w.EmployeeSubLocation
-                FROM WithBranch w
-                WHERE w.BranchUID IS NOT NULL
-            ) AS src
-               ON tgt.EmployeeReference = src.EmployeeReference
+            USING Base AS src
+               ON tgt.UUID = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.BranchReference     = src.BranchReference,
-                    tgt.EmployeeDateOfBirth = src.EmployeeDateOfBirth,
-                    tgt.EmployeeAge         = src.EmployeeAge,
-                    tgt.EmployeeCode        = src.EmployeeCode,
-                    tgt.EmployeeGender      = src.EmployeeGender,
-                    tgt.EmployeeForenames   = src.EmployeeForenames,
-                    tgt.EmployeeSurname     = src.EmployeeSurname,
-                    tgt.TelephoneNumber     = src.TelephoneNumber,
-                    tgt.PayrollNumber       = src.PayrollNumber,
+                    tgt.DOB                 = src.DOB,
+                    tgt.Code                = src.Code,
+                    tgt.Gender              = src.Gender,
+                    tgt.Forenames           = src.Forenames,
+                    tgt.Surname             = src.Surname,
+                    tgt.Telephone_Number    = src.Telephone_Number,
+                    tgt.Payroll_Number      = src.Payroll_Number,
                     tgt.Email               = src.Email,
                     tgt.Ethnicity           = src.Ethnicity,
                     tgt.Religion            = src.Religion,
-                    tgt.JobTitle            = src.JobTitle,
+                    tgt.Job_Title           = src.Job_Title,
                     tgt.Salaried            = src.Salaried,
-                    tgt.Interface           = src.Interface,
+                    tgt.Payroll_Schedule    = src.Payroll_Schedule,
                     tgt.Driver              = src.Driver,
-                    tgt.FirstLineAddress    = src.FirstLineAddress,
-                    tgt.SecondLineAddress   = src.SecondLineAddress,
-                    tgt.ThirdLineAddress    = src.ThirdLineAddress,
-                    tgt.FourthLineAddress   = src.FourthLineAddress,
+                    tgt.First_Line_Address  = src.First_Line_Address,
+                    tgt.Second_Line_Address = src.Second_Line_Address,
+                    tgt.Third_Line_Address  = src.Third_Line_Address,
+                    tgt.Fourth_Line_Address = src.Fourth_Line_Address,
                     tgt.Postcode            = src.Postcode,
-                    tgt.EmployeeSubLocation = src.EmployeeSubLocation,
                     tgt.UpdatedAtUTC        = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (
-                    EmployeeReference, BranchReference,
-                    EmployeeDateOfBirth, EmployeeAge, EmployeeCode, EmployeeGender,
-                    EmployeeForenames, EmployeeSurname, TelephoneNumber, PayrollNumber, Email,
-                    Ethnicity, Religion, JobTitle, Salaried, Interface, Driver,
-                    FirstLineAddress, SecondLineAddress, ThirdLineAddress, FourthLineAddress,
-                    Postcode, EmployeeSubLocation,
-                    CreatedAtUTC, UpdatedAtUTC
+                    UUID, DOB, Age, Code, Gender,
+                    Forenames, Surname, Telephone_Number, Payroll_Number, Email,
+                    Ethnicity, Religion, Job_Title, Salaried, Payroll_Schedule, Driver,
+                    First_Line_Address, Second_Line_Address, Third_Line_Address, Fourth_Line_Address,
+                    Postcode, CreatedAtUTC, UpdatedAtUTC
                 )
                 VALUES (
-                    src.EmployeeReference, src.BranchReference,
-                    src.EmployeeDateOfBirth, src.EmployeeAge, src.EmployeeCode, src.EmployeeGender,
-                    src.EmployeeForenames, src.EmployeeSurname, src.TelephoneNumber, src.PayrollNumber, src.Email,
-                    src.Ethnicity, src.Religion, src.JobTitle, src.Salaried, src.Interface, src.Driver,
-                    src.FirstLineAddress, src.SecondLineAddress, src.ThirdLineAddress, src.FourthLineAddress,
-                    src.Postcode, src.EmployeeSubLocation,
-                    @RunStartedAt, @RunStartedAt
+                    src.UUID, src.DOB, src.Code, src.Gender,
+                    src.Forenames, src.Surname, src.Telephone_Number, src.Payroll_Number, src.Email,
+                    src.Ethnicity, src.Religion, src.Job_Title, src.Salaried, src.Payroll_Schedule, src.Driver,
+                    src.First_Line_Address, src.Second_Line_Address, src.Third_Line_Address, src.Fourth_Line_Address,
+                    src.Postcode, @RunStartedAt, @RunStartedAt
                 )
             OUTPUT $action INTO #ActLog(Action);
 
@@ -353,22 +305,22 @@ BEGIN
 
             DELETE c
             FROM #Changed c
-            JOIN #Next n ON n.EmployeeReference = c.EmployeeReference;
+            JOIN #Next n ON n.UUID = c.UUID;
         END
 
         /* 4) Apply deletes (EMPLOYEE deletes) */
         IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
-        CREATE TABLE #DelLog(EmployeeReference int NOT NULL);
+        CREATE TABLE #DelLog(UUID int NOT NULL);
 
         DELETE t
-        OUTPUT DELETED.EmployeeReference INTO #DelLog(EmployeeReference)
+        OUTPUT DELETED.UUID INTO #DelLog(UUID)
         FROM dbo.tbl_Employees t
         JOIN (
             SELECT d.EMP_REF
             FROM CHANGETABLE(CHANGES dbo.EMPLOYEE, @LastSyncVersion) d
             WHERE d.SYS_CHANGE_OPERATION = 'D'
               AND d.SYS_CHANGE_VERSION   <= @ToVersion
-        ) x ON t.EmployeeReference = x.EMP_REF;
+        ) x ON t.UUID = x.EMP_REF;
 
         SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
         IF @EmitInfo=1 RAISERROR('Deleted from tbl_Employees due to source deletes: %d', 0, 1, @TotalDeleted) WITH NOWAIT;
