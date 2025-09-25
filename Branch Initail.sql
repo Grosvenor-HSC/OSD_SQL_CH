@@ -1,12 +1,12 @@
-USE [DOM_LIVE];
+USE [DOM_LIVE]
 GO
-SET ANSI_NULLS ON;
+SET ANSI_NULLS ON
 GO
-SET QUOTED_IDENTIFIER ON;
+SET QUOTED_IDENTIFIER ON
 GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_Sync_Branch_Initial
-    @Summary NVARCHAR(4000) = NULL OUTPUT   -- NEW: human-readable result
+    @Summary NVARCHAR(4000) = NULL OUTPUT   -- human-readable result
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -22,6 +22,7 @@ BEGIN
     DECLARE @lockResult    int;
     DECLARE @lockHeld      bit = 0;
 
+    -- Concurrency
     EXEC @lockResult = sys.sp_getapplock
         @Resource=@LockResource, @LockMode='Exclusive',
         @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal, @LockTimeout=600000;
@@ -35,14 +36,17 @@ BEGIN
     SET @lockHeld = 1;
 
     BEGIN TRY
+        -- Preconditions
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
             RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.GLOB_SITE'))
             RAISERROR('Change Tracking is not enabled on dbo.GLOB_SITE.', 16, 1);
 
+        -- Fence CT window
         SET @BaselineFrom = CHANGE_TRACKING_CURRENT_VERSION();
 
+        -- Watermark table/row
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -62,69 +66,81 @@ BEGIN
             INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion, LastSyncTime)
             VALUES (@Process, @BaselineFrom, SYSUTCDATETIME());
 
+        -- Recreate target with the SAME schema your incremental expects
         IF OBJECT_ID('dbo.tbl_Branch','U') IS NOT NULL
             DROP TABLE dbo.tbl_Branch;
 
         CREATE TABLE dbo.tbl_Branch
         (
-            BranchUID     VARCHAR(42)   NOT NULL,
-            BranchName    NVARCHAR(100) NOT NULL,
-            Brand         NVARCHAR(100) NULL,
-            Active        NVARCHAR(20)  NULL,
-            EarlyPayRate  DECIMAL(10,2) NULL,
-            OldBranchUID  VARCHAR(20)   NULL,
-            CreatedAtUTC  datetime2(3)  NOT NULL CONSTRAINT DF_tbl_Branch_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
-            UpdatedAtUTC  datetime2(3)  NOT NULL CONSTRAINT DF_tbl_Branch_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
+            BranchUID      VARCHAR(42)    NOT NULL,
+            BranchName     NVARCHAR(100)  NOT NULL,
+            Brand          NVARCHAR(100)  NULL,
+            Active         NVARCHAR(20)   NULL,
+            EarlyPayRate   DECIMAL(10,2)  NULL,
+            OldBranchUID   VARCHAR(20)    NULL,
+            CreatedAtUTC   datetime2(3)   NOT NULL CONSTRAINT DF_tbl_Branch_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
+            UpdatedAtUTC   datetime2(3)   NOT NULL CONSTRAINT DF_tbl_Branch_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
             CONSTRAINT PK_tbl_Branch PRIMARY KEY CLUSTERED (BranchUID)
         );
 
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName      ON dbo.tbl_Branch (BranchName);
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_Brand           ON dbo.tbl_Branch (Brand);
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchNameBrand ON dbo.tbl_Branch (BranchName, Brand);
-        CREATE NONCLUSTERED INDEX IX_tbl_Branch_OldBranchUID    ON dbo.tbl_Branch (OldBranchUID);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName         ON dbo.tbl_Branch (BranchName);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_Brand              ON dbo.tbl_Branch (Brand);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_BranchName_Brand   ON dbo.tbl_Branch (BranchName, Brand);
+        CREATE NONCLUSTERED INDEX IX_tbl_Branch_OldBranchUID       ON dbo.tbl_Branch (OldBranchUID);
 
-        ;WITH Expanded AS (
-            SELECT GS.GS_REF, CAST(N'Portsmouth'      AS NVARCHAR(100)) AS BranchName FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF='1970000043'
-            UNION ALL
-            SELECT GS.GS_REF, CAST(N'Southampton'     AS NVARCHAR(100)) FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF='1970000043'
-            UNION ALL
-            SELECT GS.GS_REF, CAST(N'Old_Southampton' AS NVARCHAR(100)) FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF='1970000069'
-            UNION ALL
-            SELECT GS.GS_REF, CAST(GS.NAME            AS NVARCHAR(100)) FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF NOT IN ('1970000043','1970000069')
-        ),
-        Base AS (
+        ;WITH Base AS
+        (
             SELECT
-                BranchUID    = CAST(LOWER(master.dbo.fn_varbintohexstr(HASHBYTES('SHA1', e.BranchName))) AS VARCHAR(42)),
-                BranchName   = e.BranchName,
-                Brand        = CAST(gs.VATREG AS NVARCHAR(100)),
+                BranchName = CASE
+                                WHEN gs.GS_REF='1970000043' THEN N'Southampton'      -- special-case mapping
+                                WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                                ELSE gs.NAME
+                             END,
+                Brand        = CAST(gs.VATREG   AS NVARCHAR(100)),
                 Active       = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
                 EarlyPayRate = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
-                OldBranchUID = CAST(gs.GS_REF AS VARCHAR(20))
-            FROM Expanded e
-            JOIN dbo.GLOB_SITE gs ON gs.GS_REF = e.GS_REF
-            LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = e.BranchName
+                OldBranchUID = CAST(gs.GS_REF   AS VARCHAR(20)),
+                BranchUID    = CAST(LOWER(master.dbo.fn_varbintohexstr(
+                                   HASHBYTES('SHA1',
+                                       CASE
+                                           WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+                                           WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                                           ELSE gs.NAME
+                                       END))) AS VARCHAR(42))
+            FROM dbo.GLOB_SITE gs
+            LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep
+                   ON ep.Branch = CASE
+                                      WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+                                      WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                                      ELSE gs.NAME
+                                  END
         )
-        INSERT INTO dbo.tbl_Branch (BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID)
-        SELECT BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID
+        INSERT INTO dbo.tbl_Branch
+        (
+            BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID, CreatedAtUTC, UpdatedAtUTC
+        )
+        SELECT
+            BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID, @RunStartedAt, @RunStartedAt
         FROM Base;
 
         DECLARE @BaselineInserted int = @@ROWCOUNT;
 
-        /* optional: post-baseline incremental (kept from your previous design) */
-        DECLARE @rc int = 0;
-        EXEC @rc = dbo.usp_Sync_Branch_Incremental
-            @ChunkSize=50000, @LockTimeoutMs=600000, @UseAppLock=0;
+        -- Optionally trigger incremental quietly (kept from prior design)
+        IF OBJECT_ID(N'dbo.usp_Sync_Branch_Incremental', N'P') IS NOT NULL
+        BEGIN
+            DECLARE @rc int = 0;
+            EXEC @rc = dbo.usp_Sync_Branch_Incremental
+                @ChunkSize=50000, @LockTimeoutMs=600000, @UseAppLock=0;
+        END
 
         DECLARE @EndUTC datetime2(3) = SYSUTCDATETIME();
-        DECLARE @EndIso varchar(33) = CONVERT(varchar(33), @EndUTC, 126);
+        DECLARE @EndIso varchar(33)  = CONVERT(varchar(33), @EndUTC, 126);
 
-        -- Build the human-readable summary you asked for:
         SET @Summary = CONCAT(
-            N'Branch initial started ', @RunStartedIso, N' UTC; ended ', @EndIso,
+            N'Branch initial started ', @RunStartedIso,
+            N' UTC; ended ', @EndIso,
             N' UTC; baseline inserted ', @BaselineInserted, N' rows.'
         );
-
-        -- Also surface it as a result set for SSMS:
         SELECT [Summary] = @Summary;
 
         IF @lockHeld=1 EXEC sys.sp_releaseapplock

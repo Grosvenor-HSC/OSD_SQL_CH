@@ -18,7 +18,6 @@ BEGIN
     DECLARE @Process        sysname      = N'Branch';
     DECLARE @RunStartedAt   datetime2(3) = SYSUTCDATETIME();
     DECLARE @StartIso       varchar(33)  = CONVERT(varchar(33), @RunStartedAt, 126);
-    -- declare once; reuse later
     DECLARE @EndUTC         datetime2(3);
     DECLARE @EndIso         varchar(33);
     DECLARE @DurationSec    int;
@@ -139,9 +138,8 @@ BEGIN
         END;
 
         INSERT INTO #Changed(GS_REF)
-        SELECT DISTINCT CAST(gs.GS_REF AS varchar(20))
+        SELECT DISTINCT CAST(ct.GS_REF AS varchar(20))
         FROM CHANGETABLE(CHANGES dbo.GLOB_SITE, @LastSyncVersion) ct
-        JOIN dbo.GLOB_SITE gs ON gs.GS_REF = ct.GS_REF
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion;
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
@@ -153,7 +151,6 @@ BEGIN
               SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
             WHERE ProcessName=@Process;
 
-            -- set once, don't redeclare
             SET @EndUTC = SYSUTCDATETIME();
             SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
             SET @DurationSec = DATEDIFF(SECOND, @RunStartedAt, @EndUTC);
@@ -185,39 +182,39 @@ BEGIN
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
-            ;WITH Expanded AS (
-                SELECT GS.GS_REF, N'Portsmouth'      AS BranchName FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF = '1970000043'
-                UNION ALL
-                SELECT GS.GS_REF, N'Southampton'     FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF = '1970000043'
-                UNION ALL
-                SELECT GS.GS_REF, N'Old_Southampton' FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF = '1970000069'
-                UNION ALL
-                SELECT GS.GS_REF, GS.NAME            FROM dbo.GLOB_SITE AS GS WHERE GS.GS_REF NOT IN ('1970000043','1970000069')
-            ),
-            Base AS (
+            ;WITH Base AS
+            (
                 SELECT
-                    BranchUID    = CAST(LOWER(master.dbo.fn_varbintohexstr(HASHBYTES('SHA1', e.BranchName))) AS VARCHAR(42)),
-                    BranchName   = e.BranchName,
-                    Brand        = CAST(gs.VATREG AS NVARCHAR(100)),
-                    Active       = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
-                    EarlyPayRate = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
-                    OldBranchUID = CAST(gs.GS_REF AS VARCHAR(20))
-                FROM Expanded e
-                JOIN dbo.GLOB_SITE gs ON gs.GS_REF = e.GS_REF
-                LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = e.BranchName
-                JOIN #Next n ON n.GS_REF = gs.GS_REF
+                    BranchUID     = CAST(LOWER(master.dbo.fn_varbintohexstr(HASHBYTES('SHA1',
+                                       CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+                                            WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                                            ELSE gs.NAME END))) AS VARCHAR(42)),
+                    BranchName    = CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+                                         WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                                         ELSE gs.NAME END,
+                    Brand         = CAST(gs.VATREG   AS NVARCHAR(100)),
+                    Active        = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
+                    EarlyPayRate  = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
+                    OldBranchUID  = CAST(gs.GS_REF   AS VARCHAR(20))
+                FROM dbo.GLOB_SITE gs
+                JOIN #Next n          ON n.GS_REF = gs.GS_REF
+                LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = (
+                    CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+                         WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                         ELSE gs.NAME END
+                )
             )
             MERGE dbo.tbl_Branch AS tgt
             USING Base AS src
                ON tgt.BranchUID = src.BranchUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.BranchName   = src.BranchName,
-                    tgt.Brand        = src.Brand,
-                    tgt.Active       = src.Active,
-                    tgt.EarlyPayRate = src.EarlyPayRate,
-                    tgt.OldBranchUID = src.OldBranchUID,
-                    tgt.UpdatedAtUTC = @RunStartedAt
+                    tgt.BranchName    = src.BranchName,
+                    tgt.Brand         = src.Brand,
+                    tgt.Active        = src.Active,
+                    tgt.EarlyPayRate  = src.EarlyPayRate,
+                    tgt.OldBranchUID  = src.OldBranchUID,
+                    tgt.UpdatedAtUTC  = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (BranchUID, BranchName, Brand, Active, EarlyPayRate, OldBranchUID, CreatedAtUTC, UpdatedAtUTC)
                 VALUES (src.BranchUID, src.BranchName, src.Brand, src.Active, src.EarlyPayRate, src.OldBranchUID, @RunStartedAt, @RunStartedAt)
@@ -232,11 +229,12 @@ BEGIN
             SET @TotalUpdated+=ISNULL(@u,0);
 
             DELETE c
-            FROM #Changed c JOIN #Next n ON n.GS_REF=c.GS_REF;
+            FROM #Changed c
+            JOIN #Next n ON n.GS_REF = c.GS_REF;
         END;
 
         ------------------------------------------------------------------------
-        -- 5) Deletions
+        -- 5) Deletions (rows deleted in GLOB_SITE since last sync)
         ------------------------------------------------------------------------
         DECLARE @TotalDeleted int=0;
         IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
@@ -255,7 +253,7 @@ BEGIN
         SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
 
         ------------------------------------------------------------------------
-        -- 6) Advance watermark + human-readable summary
+        -- 6) Advance watermark + summary
         ------------------------------------------------------------------------
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
@@ -263,7 +261,6 @@ BEGIN
 
         RAISERROR('Branch sync complete. Inserted=%d Updated=%d Deleted=%d',0,1,@TotalInserted,@TotalUpdated,@TotalDeleted) WITH NOWAIT;
 
-        -- set once, don't redeclare
         SET @EndUTC = SYSUTCDATETIME();
         SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
         SET @DurationSec = DATEDIFF(SECOND, @RunStartedAt, @EndUTC);
