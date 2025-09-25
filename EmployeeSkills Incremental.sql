@@ -55,8 +55,7 @@ BEGIN
             IF @EmitInfo=1 RAISERROR('CT not enabled at DB level.',16,1);
             SET @Summary = N'EmployeeSkills incremental failed: CT not enabled at DB level.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -100;
+            GOTO FinallyRelease;
         END
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.SKILL_REQD'))
@@ -64,11 +63,9 @@ BEGIN
             IF @EmitInfo=1 RAISERROR('CT not enabled on dbo.SKILL_REQD.',16,1);
             SET @Summary = N'EmployeeSkills incremental failed: CT not enabled on SKILL_REQD.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -210;
+            GOTO FinallyRelease;
         END
 
-        DECLARE @CT_EMPLOYEE   bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.EMPLOYEE'))   THEN 1 ELSE 0 END;
         DECLARE @CT_CHSYSDEC   bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC'))   THEN 1 ELSE 0 END;
         DECLARE @CT_SKILL_CATS bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.SKILL_CATS')) THEN 1 ELSE 0 END;
 
@@ -94,7 +91,6 @@ BEGIN
             FROM sys.change_tracking_tables
             WHERE object_id IN (
                 OBJECT_ID(N'dbo.SKILL_REQD'),
-                CASE WHEN @CT_EMPLOYEE=1   THEN OBJECT_ID(N'dbo.EMPLOYEE')   ELSE NULL END,
                 CASE WHEN @CT_CHSYSDEC=1   THEN OBJECT_ID(N'dbo.CHSYSDEC')   ELSE NULL END,
                 CASE WHEN @CT_SKILL_CATS=1 THEN OBJECT_ID(N'dbo.SKILL_CATS') ELSE NULL END
             )
@@ -105,8 +101,7 @@ BEGIN
             IF @EmitInfo=1 RAISERROR('Watermark %I64d < CT min valid %I64d (re-baseline).',16,1,@LastSyncVersion,@MinValid);
             SET @Summary = CONCAT(N'EmployeeSkills incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N'.');
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -200;
+            GOTO FinallyRelease;
         END
 
         DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
@@ -115,54 +110,47 @@ BEGIN
         BEGIN
             RAISERROR('EmployeeSkills CT window:', 0, 1) WITH NOWAIT;
             RAISERROR('  From=%I64d', 0, 1, @LastSyncVersion) WITH NOWAIT;
-            RAISERROR('  To  =%I64d', 0, 1, @ToVersion) WITH NOWAIT;
+            RAISERROR('  To  =%I64d', 0, 1, @ToVersion)       WITH NOWAIT;
         END
 
         /* ----------------------- 2) Build changed key set ----------------------- */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (EmployeeSkillReference int NOT NULL PRIMARY KEY);
+        CREATE TABLE #Changed (UUID int NOT NULL PRIMARY KEY);  -- UUID == SKILLREQ_REF
 
-        INSERT INTO #Changed(EmployeeSkillReference)
+        -- SKILL_REQD changes (I/U/D — we’ll also handle deletes later)
+        INSERT INTO #Changed(UUID)
         SELECT DISTINCT x.SKILLREQ_REF
         FROM CHANGETABLE(CHANGES dbo.SKILL_REQD, @LastSyncVersion) x
         WHERE x.SYS_CHANGE_VERSION <= @ToVersion;
 
-        IF @CT_EMPLOYEE = 1
-        BEGIN
-            INSERT INTO #Changed(EmployeeSkillReference)
-            SELECT DISTINCT sr.SKILLREQ_REF
-            FROM CHANGETABLE(CHANGES dbo.EMPLOYEE, @LastSyncVersion) ce
-            JOIN dbo.SKILL_REQD sr ON TRY_CONVERT(int, sr.[REFERENCE]) = ce.EMP_REF
-            WHERE sr.REF_TYPE = 2
-              AND ce.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeSkillReference = sr.SKILLREQ_REF);
-        END
-        ELSE IF @EmitInfo=1
-            RAISERROR('Note: CT not enabled on EMPLOYEE; branch moves may be delayed.', 0, 1) WITH NOWAIT;
-
+        -- Description text changes (CHSYSDEC) → touch affected SKILL_REQD rows
         IF @CT_CHSYSDEC = 1
         BEGIN
-            INSERT INTO #Changed(EmployeeSkillReference)
+            INSERT INTO #Changed(UUID)
             SELECT DISTINCT sr.SKILLREQ_REF
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) d
-            JOIN dbo.SKILL_REQD sr ON sr.SKILL_REF = d.DECODE_REF
+            JOIN dbo.SKILL_REQD sr
+              ON sr.SKILL_REF = d.DECODE_REF
             WHERE sr.REF_TYPE = 2
               AND d.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeSkillReference = sr.SKILLREQ_REF);
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = sr.SKILLREQ_REF);
         END
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on CHSYSDEC; skill text changes may be delayed.', 0, 1) WITH NOWAIT;
 
+        -- Category text changes (SKILL_CATS) → touch affected SKILL_REQD rows
         IF @CT_SKILL_CATS = 1
         BEGIN
-            INSERT INTO #Changed(EmployeeSkillReference)
+            INSERT INTO #Changed(UUID)
             SELECT DISTINCT sr.SKILLREQ_REF
             FROM CHANGETABLE(CHANGES dbo.SKILL_CATS, @LastSyncVersion) sc
-            JOIN dbo.SKILL_REQD sr ON sr.REF_TYPE = 2
-            JOIN dbo.CHSYSDEC d    ON d.DECODE_REF = sr.SKILL_REF AND d.GROUP1 = 2 AND d.CODE = 'SKIL'
-            WHERE d.VALUE1 = sc.SKILL_REF
-              AND sc.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.EmployeeSkillReference = sr.SKILLREQ_REF);
+            JOIN dbo.CHSYSDEC d  ON d.GROUP1 = 2 AND d.CODE = 'SKIL'
+            JOIN dbo.SKILL_REQD sr
+              ON sr.REF_TYPE = 2
+             AND sr.SKILL_REF = d.DECODE_REF
+             AND d.VALUE1 = sc.SKILL_REF
+            WHERE sc.SYS_CHANGE_VERSION <= @ToVersion
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = sr.SKILLREQ_REF);
         END
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on SKILL_CATS; category text changes may be delayed.', 0, 1) WITH NOWAIT;
@@ -187,151 +175,113 @@ BEGIN
             );
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN 0;
+            GOTO FinallyRelease;
         END
 
-        /* ----------------------- 3) Chunked UPSERT (no MERGE) ----------------------- */
+        /* ----------------------- 3) Chunked UPSERT ----------------------- */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next (EmployeeSkillReference int NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next (UUID int NOT NULL PRIMARY KEY);
 
-            INSERT INTO #Next(EmployeeSkillReference)
-            SELECT TOP (@ChunkSize) EmployeeSkillReference
+            INSERT INTO #Next(UUID)
+            SELECT TOP (@ChunkSize) UUID
             FROM #Changed
-            ORDER BY EmployeeSkillReference;
+            ORDER BY UUID;
 
-            IF OBJECT_ID('tempdb..#Src') IS NOT NULL DROP TABLE #Src;
-            CREATE TABLE #Src (
-                EmployeeSkillReference             int           NOT NULL PRIMARY KEY,
-                EmployeeReference                  varchar(20)   NOT NULL,
-                EmployeeKeySkillDescription        varchar(255)  NULL,
-                EmployeeKeySkillValidFromDate      datetime2     NULL,
-                EmployeeKeySkillValidToDate        datetime2     NULL,
-                EmployeeKeySkillNotes              nvarchar(max) NULL,
-                EmployeeKeySkillRefField           varchar(50)   NULL,
-                UpdatedEmployeeKeySkillValidToDate datetime2     NULL,
-                EmployeeKeySkillCategory           varchar(255)  NULL,
-                BranchReference                    nvarchar(55)  NULL
-            );
+            IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
+            CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
             ;WITH SR AS (
                 SELECT
-                    sr.SKILLREQ_REF,
-                    EMP_REF      = TRY_CONVERT(int, sr.[REFERENCE]),
+                    sr.SKILLREQ_REF                                      AS UUID,
+                    TRY_CONVERT(int, sr.[REFERENCE])                     AS EMP_REF,
                     sr.SKILL_REF,
-                    StartDT      = TRY_CONVERT(datetime2, sr.VAL_START_DTM),
-                    EndDT        = TRY_CONVERT(datetime2, sr.VAL_END_DTM),
-                    Notes        = CAST(sr.NOTES AS nvarchar(max)),
-                    REFFIELD     = sr.REFFIELD
+                    TRY_CONVERT(datetime2, sr.VAL_START_DTM)             AS StartDT,
+                    TRY_CONVERT(datetime2, sr.VAL_END_DTM)               AS EndDT,
+                    CAST(sr.NOTES AS nvarchar(max))                      AS Notes
                 FROM dbo.SKILL_REQD sr
-                JOIN #Next n ON n.EmployeeSkillReference = sr.SKILLREQ_REF
+                JOIN #Next n ON n.UUID = sr.SKILLREQ_REF
                 WHERE sr.REF_TYPE = 2
-            )
-            INSERT INTO #Src (
-                EmployeeSkillReference, EmployeeReference, EmployeeKeySkillDescription,
-                EmployeeKeySkillValidFromDate, EmployeeKeySkillValidToDate,
-                EmployeeKeySkillNotes, EmployeeKeySkillRefField,
-                UpdatedEmployeeKeySkillValidToDate, EmployeeKeySkillCategory, BranchReference
-            )
-            SELECT
-                s.SKILLREQ_REF,
-                CAST(s.EMP_REF AS varchar(20)),
-                CAST(LTRIM(RTRIM(d.DESCRIPTION)) AS varchar(255)),
-                s.StartDT,
-                s.EndDT,
-                s.Notes,
-                s.REFFIELD,
-                ISNULL(s.EndDT, SYSUTCDATETIME()),
-                CAST(cat.DESC_TXT AS varchar(255)),
-                CAST(b.BranchUID AS nvarchar(55))
-            FROM SR s
-            JOIN dbo.EMPLOYEE e   ON e.EMP_REF = s.EMP_REF
-            JOIN dbo.tbl_Branch b ON e.GS_REF  = b.OldBranchUID
-            CROSS APPLY (
-                SELECT TOP (1) d.DESCRIPTION, d.VALUE1
+            ),
+            D AS (  -- decode table rows for skills (same rule as initial)
+                SELECT d.DECODE_REF, LTRIM(RTRIM(d.DESCRIPTION)) AS DESCRIPTION, d.VALUE1
                 FROM dbo.CHSYSDEC d
-                WHERE d.DECODE_REF = s.SKILL_REF
-                  AND d.GROUP1 = 2 AND d.CODE = 'SKIL'
-                ORDER BY d.DECODE_REF
-            ) d
-            OUTER APPLY (
-                SELECT TOP (1) sc.DESC_TXT
-                FROM dbo.SKILL_CATS sc
-                WHERE sc.SKILL_REF = d.VALUE1
-                ORDER BY sc.DESC_TXT
-            ) cat;
-
-            /* UPDATE */
-            DECLARE @i int = 0, @u int = 0, @d int = 0;
-
-            UPDATE tgt
-            SET
-                tgt.EmployeeReference                  = s.EmployeeReference,
-                tgt.EmployeeKeySkillDescription        = s.EmployeeKeySkillDescription,
-                tgt.EmployeeKeySkillValidFromDate      = s.EmployeeKeySkillValidFromDate,
-                tgt.EmployeeKeySkillValidToDate        = s.EmployeeKeySkillValidToDate,
-                tgt.EmployeeKeySkillNotes              = s.EmployeeKeySkillNotes,
-                tgt.EmployeeKeySkillRefField           = s.EmployeeKeySkillRefField,
-                tgt.UpdatedEmployeeKeySkillValidToDate = s.UpdatedEmployeeKeySkillValidToDate,
-                tgt.EmployeeKeySkillCategory           = s.EmployeeKeySkillCategory,
-                tgt.BranchReference                    = s.BranchReference,
-                tgt.UpdatedAtUTC                       = @RunStartedAt
-            FROM dbo.tbl_EmployeeSkills AS tgt
-            JOIN #Src                     AS s
-              ON s.EmployeeSkillReference = tgt.EmployeeSkillReference;
-
-            SET @u = @@ROWCOUNT;
-
-            /* INSERT */
-            INSERT INTO dbo.tbl_EmployeeSkills (
-                EmployeeReference, EmployeeKeySkillDescription, EmployeeSkillReference,
-                EmployeeKeySkillValidFromDate, EmployeeKeySkillValidToDate, EmployeeKeySkillNotes,
-                EmployeeKeySkillRefField, UpdatedEmployeeKeySkillValidToDate, EmployeeKeySkillCategory,
-                BranchReference, CreatedAtUTC, UpdatedAtUTC
+                WHERE d.GROUP1 = 2 AND d.CODE = 'SKIL'
+            ),
+            Base AS (
+                SELECT
+                    s.UUID,
+                    Employee_UUID     = CAST(s.EMP_REF AS varchar(20)),
+                    Skill_Description = CAST(d.DESCRIPTION AS varchar(255)),
+                    Valid_From_Date   = s.StartDT,
+                    Valid_To_Date     = s.EndDT,
+                    Notes             = s.Notes,
+                    Skill_Category    = CAST(sc.DESC_TXT AS varchar(255))
+                FROM SR s
+                LEFT JOIN D              d  ON d.DECODE_REF = s.SKILL_REF
+                LEFT JOIN dbo.SKILL_CATS sc ON sc.SKILL_REF = d.VALUE1
             )
+            MERGE dbo.tbl_EmployeeSkills AS tgt
+            USING Base AS src
+               ON tgt.UUID = src.UUID
+            WHEN MATCHED THEN
+                UPDATE SET
+                    tgt.Employee_UUID     = src.Employee_UUID,
+                    tgt.Skill_Description = src.Skill_Description,
+                    tgt.Valid_From_Date   = src.Valid_From_Date,
+                    tgt.Valid_To_Date     = src.Valid_To_Date,
+                    tgt.Notes             = src.Notes,
+                    tgt.Skill_Category    = src.Skill_Category,
+                    tgt.UpdatedAtUTC      = @RunStartedAt
+            WHEN NOT MATCHED BY TARGET THEN
+                INSERT (
+                    Employee_UUID, Skill_Description, UUID,
+                    Valid_From_Date, Valid_To_Date, Notes, Skill_Category,
+                    CreatedAtUTC, UpdatedAtUTC
+                )
+                VALUES (
+                    src.Employee_UUID, src.Skill_Description, src.UUID,
+                    src.Valid_From_Date, src.Valid_To_Date, src.Notes, src.Skill_Category,
+                    @RunStartedAt, @RunStartedAt
+                )
+            OUTPUT $action INTO #ActLog(Action);
+
+            DECLARE @i int=0, @u int=0;
             SELECT
-                s.EmployeeReference, s.EmployeeKeySkillDescription, s.EmployeeSkillReference,
-                s.EmployeeKeySkillValidFromDate, s.EmployeeKeySkillValidToDate, s.EmployeeKeySkillNotes,
-                s.EmployeeKeySkillRefField, s.UpdatedEmployeeKeySkillValidToDate, s.EmployeeKeySkillCategory,
-                s.BranchReference, @RunStartedAt, @RunStartedAt
-            FROM #Src s
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM dbo.tbl_EmployeeSkills t
-                WHERE t.EmployeeSkillReference = s.EmployeeSkillReference
-            );
+                @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
+                @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END)
+            FROM #ActLog;
 
-            SET @i = @@ROWCOUNT;
-
-            /* DELETE */
-            DELETE t
-            FROM dbo.tbl_EmployeeSkills t
-            JOIN #Next nn ON nn.EmployeeSkillReference = t.EmployeeSkillReference
-            LEFT JOIN #Src s ON s.EmployeeSkillReference = t.EmployeeSkillReference
-            WHERE s.EmployeeSkillReference IS NULL;
-
-            SET @d = @@ROWCOUNT;
-
-            /* Tally + progress */
             SET @TotalInserted += ISNULL(@i,0);
             SET @TotalUpdated  += ISNULL(@u,0);
-            SET @TotalDeleted  += ISNULL(@d,0);
 
             IF @EmitInfo=1
-                RAISERROR('EmployeeSkills chunk: inserted=%d updated=%d deleted=%d (running %d/%d/%d)',
-                          0,1,@i,@u,@d,@TotalInserted,@TotalUpdated,@TotalDeleted) WITH NOWAIT;
+                RAISERROR('EmployeeSkills chunk: inserted=%d updated=%d (running %d/%d)',
+                          0,1,@i,@u,@TotalInserted,@TotalUpdated) WITH NOWAIT;
 
-            /* Remove processed keys */
             DELETE c
             FROM #Changed c
-            JOIN #Next   n ON n.EmployeeSkillReference = c.EmployeeSkillReference;
-
-            DROP TABLE #Src;
+            JOIN #Next n ON n.UUID = c.UUID;
         END
+
+        /* ----------------------- 3b) Apply hard deletes from SKILL_REQD ----------------------- */
+        IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
+        CREATE TABLE #DelLog(UUID int NOT NULL);
+
+        DELETE t
+        OUTPUT DELETED.UUID INTO #DelLog(UUID)
+        FROM dbo.tbl_EmployeeSkills t
+        JOIN (
+            SELECT d.SKILLREQ_REF
+            FROM CHANGETABLE(CHANGES dbo.SKILL_REQD, @LastSyncVersion) d
+            WHERE d.SYS_CHANGE_OPERATION = 'D'
+              AND d.SYS_CHANGE_VERSION   <= @ToVersion
+        ) x ON t.UUID = x.SKILLREQ_REF;
+
+        SET @TotalDeleted += (SELECT COUNT(*) FROM #DelLog);
 
         /* ----------------------- 4) Advance watermark + summary ----------------------- */
         UPDATE dbo.CT_Watermark
@@ -354,6 +304,7 @@ BEGIN
         IF @EmitInfo=1 RAISERROR('EmployeeSkills incremental sync complete.', 0, 1) WITH NOWAIT;
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
+FinallyRelease:
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
         RETURN 0;
     END TRY
