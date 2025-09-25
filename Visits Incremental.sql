@@ -14,7 +14,6 @@ BEGIN
     DECLARE @Process       sysname      = N'Visits';
     DECLARE @RunStartedAt  datetime2(3) = SYSUTCDATETIME();
     DECLARE @StartIso      varchar(33)  = CONVERT(varchar(33), @RunStartedAt, 126);
-    -- Declare once; we'll SET these in both branches later
     DECLARE @EndUTC        datetime2(3) = NULL;
     DECLARE @EndIso        varchar(33)  = NULL;
     DECLARE @DurationSec   int          = NULL;
@@ -144,176 +143,81 @@ BEGIN
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
-            ;WITH CarerCounts AS (
-                SELECT AHD.MLINKREF, COUNT(*) AS NumberCarers
-                FROM dbo.ACTIVITY_HD AHD WITH (NOLOCK)
-                JOIN #NextKeys NK ON NK.ACT_REF = AHD.ACT_REF
-                WHERE AHD.MLINKREF <> 0
-                GROUP BY AHD.MLINKREF
-            ),
-            VisitsBase AS (
-                SELECT
-                    CAST(AHD.ACT_REF     AS varchar(50)) AS VisitReference,
-                    CAST(AHD.CLIENT_REF  AS varchar(50)) AS ClientReference,
-                    CAST(AHD.EMP_REF     AS varchar(50)) AS EmployeeReference,
-                    CAST(CPDT.EMP_REF    AS varchar(50)) AS CareplanEmployeeReference,
-                    CASE WHEN AHD.EMP_REF = 0 THEN 'Unallocated' ELSE 'Allocated' END AS VisitAllocation,
-                    CPDT.QUANTITY AS PlannedQuantity,
-                    IIF(CPDT.EMP_REF IS NULL OR CPDT.EMP_REF = 0, 1, 0) AS NoEmpInTemplate,
-                    IIF(CPDT.EMP_REF IS NOT NULL AND CPDT.EMP_REF <> AHD.EMP_REF, 1, 0) AS EmpChangedFromTemplate,
-                    IIF(TRY_CAST(CPDT.TIMEOFDAY AS TIME) IS NOT NULL
-                        AND TRY_CAST(CPDT.TIMEOFDAY AS TIME) <> CAST(AHD.START_DTM AS TIME), 1, 0) AS TimeChangedFromTemplate,
-                    CAST(AHD.END_DTM   AS TIME)      AS VisitEndTime,
-                    CAST(AHD.END_DTM   AS DATE)      AS VisitEndDate,
-                    CAST(AHD.END_DTM   AS DATETIME2) AS VisitEndDateTime,
-                    CAST(CL.BranchReference AS varchar(50)) AS BranchReference,
-                    CAST(AHD.ORIGSTDTM AS TIME)      AS VisitOriginalStartTime,
-                    CAST(AHD.ORIGSTDTM AS DATE)      AS VisitOriginalStartDate,
-                    CAST(AHD.START_DTM AS TIME)      AS VisitStartTime,
-                    TRY_CAST(CPDT.TIMEOFDAY AS TIME) AS CareplanVisitStartTime,
-                    CAST(AHD.START_DTM AS DATE)      AS VisitStartDate,
-                    CAST(AHD.START_DTM AS DATETIME2) AS VisitStartDateTime,
-                    DATEADD(day, 1 - DATEPART(weekday, CAST(AHD.START_DTM AS DATE)), CAST(AHD.START_DTM AS DATE)) AS WeekStartDate,
-                    DATEADD(day, 7 - DATEPART(weekday, CAST(AHD.END_DTM   AS DATE)), CAST(AHD.END_DTM   AS DATE)) AS WeekEndDate,
-                    AHD.CPLAN_DET_REF                AS CareplanRef,
-                    SHD.SERVICE_CODE                 AS VisitServiceCode,
-                    CAST(CHD.CONTRACT_REF AS varchar(50)) AS ContractReference,
+            ;WITH VisitsBase AS (
+                                 SELECT
+                    CAST(AHD.ACT_REF     AS varchar(50)) AS UUID,
+                    CAST(AHD.CLIENT_REF  AS varchar(50)) AS Client_UUID,
+                    CASE WHEN AHD.EMP_REF = 0  THEN NULL ELSE CAST(AHD.EMP_REF  AS varchar(50)) END AS Employee_UUID,
+                    CASE WHEN CPDT.EMP_REF = 0 THEN NULL ELSE CAST(CPDT.EMP_REF AS varchar(50)) END AS Planned_Employee_UUID,
+                    CASE WHEN AHD.CPLAN_DET_REF = 0 THEN NULL ELSE AHD.CPLAN_DET_REF END          AS Careplan_UUID,
+                    CASE WHEN AHD.GS_REF = 0 THEN NULL ELSE AHD.GS_REF END                       AS Group_UUID,         
+                    CAST(AHD.GS_REF AS varchar(50))       AS Branch_UUID,
+                    CAST(CHD.CONTRACT_REF AS varchar(50)) AS Contract_UUID,
+                    CASE WHEN AHD.MLINKREF = 0 THEN NULL ELSE AHD.MLINKREF END                     AS Linked_Visit_UUID,
+                    CAST(COALESCE(CPDT.QUANTITY,0) * 60 AS INT)                                    AS Planned_Duration,
+                    CAST(AHD.ORIGSTDTM AS DATETIME2)                                              AS Planned_Visit_Start_Date_Time,
+                    CAST(DATEADD(MINUTE, COALESCE(CPDT.QUANTITY,0), AHD.ORIGSTDTM) AS DATETIME2)  AS Planned_Visit_End_Date_Time,
+                    DATEDIFF(MINUTE, AHD.START_DTM, AHD.END_DTM)                                   AS Actual_Duration,
+                    CAST(AHD.START_DTM AS DATETIME2)                                              AS Actual_Visit_Start_Date_Time,
+                    CAST(AHD.END_DTM   AS DATETIME2)                                              AS Actual_Visit_End_Date_Time,
+                    SHD.SERVICE_CODE                                                                AS Visit_Code,
                     CASE 
-                        WHEN AHD.CPLAN_DET_REF <> 0 THEN 'From Template Careplan'
+                        WHEN AHD.CPLAN_DET_REF <> 0                        THEN 'From Template Careplan'
                         WHEN AHD.CPLAN_DET_REF = 0 AND AHD.RNB_VISIT = 'Y' THEN 'From Booking'
                         WHEN AHD.CPLAN_DET_REF = 0 AND AHD.RNB_VISIT <> 'Y' THEN 'Ad-Hoc Entry'
                         ELSE '' 
-                    END AS VisitOrigin,
-                    AHD.INV_STATUS                   AS VisitInvoiceStatus,
-                    AHD.PAY_STATUS                   AS VisitPayStatus,
-                    CASE WHEN AHD.MLINKREF > 0 THEN 'Yes' ELSE 'No' END AS VisitMultiEmployeeFlag,
-                    CAST(DATEDIFF(MINUTE, AHD.START_DTM, AHD.END_DTM) AS FLOAT) / 60 AS VisitCalculatedDuration,
-                    SHD.SERVICE_CODE                 AS ServiceCode,
-                    CS.DESCRIPTION                   AS ContractSource,
-                    AHD.MLINKREF                     AS MultiCareRef,
-                    AHD.CANC_PAY                     AS CancelPayFlag
-                FROM dbo.ACTIVITY_HD AS AHD WITH (NOLOCK)
-                JOIN #NextKeys NK ON NK.ACT_REF = AHD.ACT_REF
-                LEFT JOIN dbo.tbl_Clients  AS CL  WITH (NOLOCK) ON CL.ClientReference = AHD.CLIENT_REF
-                LEFT JOIN dbo.CONTRACT_DT  AS CDT WITH (NOLOCK) ON AHD.CONT_DET_REF   = CDT.CONT_DET_REF
-                LEFT JOIN dbo.CONTRACT_HD  AS CHD WITH (NOLOCK) ON CDT.CONTRACT_REF   = CHD.CONTRACT_REF
-                LEFT JOIN dbo.SERVICE_HD   AS SHD WITH (NOLOCK) ON AHD.SERVICE_REF    = SHD.SERVICE_REF
-                LEFT JOIN dbo.CAREPLAN_DT  AS CPDT WITH (NOLOCK) ON AHD.CPLAN_DET_REF = CPDT.CPLAN_DET_REF
-                LEFT JOIN dbo.CHSYSDEC     AS CS  WITH (NOLOCK) ON CHD.CONTRACT_SOURCE= CS.DECODE_REF
+                    END                                                                             AS Visit_Origin,
+                    AHD.INV_STATUS                                                                  AS Visit_Invoice_Status,
+                    AHD.PAY_STATUS                                                                  AS Visit_Pay_Status,
+                    CASE WHEN LEN(AHD.CANC_PAY) >= 1 THEN AHD.CANC_PAY ELSE NULL END                AS Cancel_Pay_Flag
+                FROM dbo.ACTIVITY_HD AS AHD
+                JOIN #NextKeys NK                 ON NK.ACT_REF       = AHD.ACT_REF          -- <<< missing in your proc
+                LEFT JOIN dbo.CONTRACT_DT  AS CDT ON AHD.CONT_DET_REF = CDT.CONT_DET_REF
+                LEFT JOIN dbo.CONTRACT_HD  AS CHD ON CDT.CONTRACT_REF = CHD.CONTRACT_REF
+                LEFT JOIN dbo.SERVICE_HD   AS SHD ON AHD.SERVICE_REF  = SHD.SERVICE_REF
+                LEFT JOIN dbo.CAREPLAN_DT  AS CPDT ON AHD.CPLAN_DET_REF = CPDT.CPLAN_DET_REF
                 WHERE AHD.[TYPE] <> 1
+                AND AHD.START_DTM >= DATEADD(MONTH, -6, SYSUTCDATETIME()) 
             )
             MERGE dbo.tbl_Visits AS tgt
-            USING (
-                SELECT 
-                    v.VisitReference,
-                    v.ClientReference,
-                    v.EmployeeReference,
-                    v.CareplanEmployeeReference,
-                    v.VisitAllocation,
-                    v.PlannedQuantity,
-                    v.NoEmpInTemplate,
-                    v.EmpChangedFromTemplate,
-                    v.TimeChangedFromTemplate,
-                    v.VisitEndTime,
-                    v.VisitEndDate,
-                    v.VisitEndDateTime,
-                    v.BranchReference,
-                    v.VisitOriginalStartTime,
-                    v.VisitOriginalStartDate,
-                    v.VisitStartTime,
-                    v.CareplanVisitStartTime,
-                    v.VisitStartDate,
-                    v.VisitStartDateTime,
-                    v.WeekStartDate,
-                    v.WeekEndDate,
-                    v.CareplanRef,
-                    v.VisitServiceCode,
-                    v.ContractReference,
-                    v.VisitOrigin,
-                    v.VisitInvoiceStatus,
-                    v.VisitPayStatus,
-                    v.VisitMultiEmployeeFlag,
-                    v.VisitCalculatedDuration,
-                    v.ServiceCode,
-                    v.ContractSource,
-                    v.MultiCareRef,
-                    IIF(v.NoEmpInTemplate = 0 AND v.EmpChangedFromTemplate = 0 AND v.TimeChangedFromTemplate = 0, 1, 0) AS NotChangedFromTemplate,
-                    ISNULL(cc.NumberCarers, 1) AS NumberCarersOnVisit,
-                    v.CancelPayFlag
-                FROM VisitsBase v
-                LEFT JOIN CarerCounts cc ON v.MultiCareRef = cc.MLINKREF
-            ) AS src
-               ON tgt.VisitReference = src.VisitReference
+            USING (SELECT * FROM VisitsBase) AS src
+              ON tgt.UUID = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.ClientReference           = src.ClientReference,
-                    tgt.EmployeeReference         = src.EmployeeReference,
-                    tgt.CareplanEmployeeReference = src.CareplanEmployeeReference,
-                    tgt.VisitAllocation           = src.VisitAllocation,
-                    tgt.PlannedQuantity           = src.PlannedQuantity,
-                    tgt.NoEmpInTemplate           = src.NoEmpInTemplate,
-                    tgt.EmpChangedFromTemplate    = src.EmpChangedFromTemplate,
-                    tgt.TimeChangedFromTemplate   = src.TimeChangedFromTemplate,
-                    tgt.VisitEndTime              = src.VisitEndTime,
-                    tgt.VisitEndDate              = src.VisitEndDate,
-                    tgt.VisitEndDateTime          = src.VisitEndDateTime,
-                    tgt.BranchReference           = src.BranchReference,
-                    tgt.VisitOriginalStartTime    = src.VisitOriginalStartTime,
-                    tgt.VisitOriginalStartDate    = src.VisitOriginalStartDate,
-                    tgt.VisitStartTime            = src.VisitStartTime,
-                    tgt.CareplanVisitStartTime    = src.CareplanVisitStartTime,
-                    tgt.VisitStartDate            = src.VisitStartDate,
-                    tgt.VisitStartDateTime        = src.VisitStartDateTime,
-                    tgt.WeekStartDate             = src.WeekStartDate,
-                    tgt.WeekEndDate               = src.WeekEndDate,
-                    tgt.CareplanRef               = src.CareplanRef,
-                    tgt.VisitServiceCode          = src.VisitServiceCode,
-                    tgt.ContractReference         = src.ContractReference,
-                    tgt.VisitOrigin               = src.VisitOrigin,
-                    tgt.VisitInvoiceStatus        = src.VisitInvoiceStatus,
-                    tgt.VisitPayStatus            = src.VisitPayStatus,
-                    tgt.VisitMultiEmployeeFlag    = src.VisitMultiEmployeeFlag,
-                    tgt.VisitCalculatedDuration   = src.VisitCalculatedDuration,
-                    tgt.ServiceCode               = src.ServiceCode,
-                    tgt.ContractSource            = src.ContractSource,
-                    tgt.MultiCareRef              = src.MultiCareRef,
-                    tgt.NotChangedFromTemplate    = src.NotChangedFromTemplate,
-                    tgt.NumberCarersOnVisit       = src.NumberCarersOnVisit,
-                    tgt.CancelPayFlag             = src.CancelPayFlag,
-                    tgt.UpdatedAtUTC              = @RunStartedAt
+                    tgt.Client_UUID              = src.Client_UUID,
+                    tgt.Employee_UUID            = src.Employee_UUID,
+                    tgt.Planned_Employee_UUID    = src.Planned_Employee_UUID,
+                    tgt.Careplan_UUID            = src.Careplan_UUID,
+                    tgt.Branch_UUID              = src.Branch_UUID,
+                    tgt.Contract_UUID            = src.Contract_UUID,
+                    tgt.Linked_Visit_UUID        = src.Linked_Visit_UUID,
+                    tgt.Planned_Duration         = src.Planned_Duration,
+                    tgt.Planned_Visit_Start_Date_Time = src.Planned_Visit_Start_Date_Time,
+                    tgt.Planned_Visit_End_Date_Time   = src.Planned_Visit_End_Date_Time,
+                    tgt.Actual_Duration          = src.Actual_Duration,
+                    tgt.Actual_Visit_Start_Date_Time  = src.Actual_Visit_Start_Date_Time,
+                    tgt.Actual_Visit_End_Date_Time    = src.Actual_Visit_End_Date_Time,
+                    tgt.Visit_Code               = src.Visit_Code,
+                    tgt.Visit_Origin             = src.Visit_Origin,
+                    tgt.Visit_Invoice_Status     = src.Visit_Invoice_Status,
+                    tgt.Visit_Pay_Status         = src.Visit_Pay_Status,
+                    tgt.Cancel_Pay_Flag          = src.Cancel_Pay_Flag,
+                    tgt.UpdatedAtUTC             = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
-                INSERT (
-                    VisitReference, ClientReference, EmployeeReference, CareplanEmployeeReference,
-                    VisitAllocation, PlannedQuantity, NoEmpInTemplate, EmpChangedFromTemplate, TimeChangedFromTemplate,
-                    VisitEndTime, VisitEndDate, VisitEndDateTime,
-                    BranchReference, VisitOriginalStartTime, VisitOriginalStartDate,
-                    VisitStartTime, CareplanVisitStartTime, VisitStartDate, VisitStartDateTime,
-                    WeekStartDate, WeekEndDate,
-                    CareplanRef, VisitServiceCode, ContractReference, VisitOrigin,
-                    VisitInvoiceStatus, VisitPayStatus, VisitMultiEmployeeFlag,
-                    VisitCalculatedDuration, ServiceCode, ContractSource, MultiCareRef,
-                    NotChangedFromTemplate, NumberCarersOnVisit, CancelPayFlag,
-                    CreatedAtUTC, UpdatedAtUTC
-                )
-                VALUES (
-                    src.VisitReference, src.ClientReference, src.EmployeeReference, src.CareplanEmployeeReference,
-                    src.VisitAllocation, src.PlannedQuantity, src.NoEmpInTemplate, src.EmpChangedFromTemplate, src.TimeChangedFromTemplate,
-                    src.VisitEndTime, src.VisitEndDate, src.VisitEndDateTime,
-                    src.BranchReference, src.VisitOriginalStartTime, src.VisitOriginalStartDate,
-                    src.VisitStartTime, src.CareplanVisitStartTime, src.VisitStartDate, src.VisitStartDateTime,
-                    src.WeekStartDate, src.WeekEndDate,
-                    src.CareplanRef, src.VisitServiceCode, src.ContractReference, src.VisitOrigin,
-                    src.VisitInvoiceStatus, src.VisitPayStatus, src.VisitMultiEmployeeFlag,
-                    src.VisitCalculatedDuration, src.ServiceCode, src.ContractSource, src.MultiCareRef,
-                    src.NotChangedFromTemplate, src.NumberCarersOnVisit, src.CancelPayFlag,
-                    @RunStartedAt, @RunStartedAt
-                )
+                INSERT (UUID, Client_UUID, Employee_UUID, Planned_Employee_UUID, Careplan_UUID,
+                        Branch_UUID, Contract_UUID, Linked_Visit_UUID, Planned_Duration,
+                        Planned_Visit_Start_Date_Time, Planned_Visit_End_Date_Time, Actual_Duration,
+                        Actual_Visit_Start_Date_Time, Actual_Visit_End_Date_Time, Visit_Code,
+                        Visit_Origin, Visit_Invoice_Status, Visit_Pay_Status, Cancel_Pay_Flag,
+                        CreatedAtUTC, UpdatedAtUTC)
+                VALUES (src.UUID, src.Client_UUID, src.Employee_UUID, src.Planned_Employee_UUID, src.Careplan_UUID,
+                        src.Branch_UUID, src.Contract_UUID, src.Linked_Visit_UUID, src.Planned_Duration,
+                        src.Planned_Visit_Start_Date_Time, src.Planned_Visit_End_Date_Time, src.Actual_Duration,
+                        src.Actual_Visit_Start_Date_Time, src.Actual_Visit_End_Date_Time, src.Visit_Code,
+                        src.Visit_Origin, src.Visit_Invoice_Status, src.Visit_Pay_Status, src.Cancel_Pay_Flag,
+                        @RunStartedAt, @RunStartedAt)
             WHEN NOT MATCHED BY SOURCE
-                 AND EXISTS (
-                     SELECT 1
-                     FROM #NextKeys nn
-                     WHERE CAST(nn.ACT_REF AS varchar(50)) = tgt.VisitReference
-                 )
+                 AND EXISTS (SELECT 1 FROM #NextKeys nn WHERE CAST(nn.ACT_REF AS varchar(50)) = tgt.UUID)
                  THEN DELETE
             OUTPUT $action INTO #ActLog(Action);
 

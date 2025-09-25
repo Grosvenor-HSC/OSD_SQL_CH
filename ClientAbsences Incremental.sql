@@ -5,17 +5,18 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-ALTER PROCEDURE [dbo].[usp_Sync_ClientAbsences_Incremental]
-    @ChunkSize         int  = 100000,        -- tune as needed
+CREATE OR ALTER PROCEDURE dbo.usp_Sync_ClientAbsences_Incremental
+    @ChunkSize         int  = 100000,               -- tune as needed
     @LockTimeoutMs     int  = 60000,
     @UseAppLock        bit  = 1,
-    @EmitInfo          bit  = 0,             -- 0 = quiet, 1 = print progress
-    @Summary           nvarchar(4000) = NULL OUTPUT,  -- one-line summary
-    @ReturnSummaryRow  bit  = 1              -- NEW: emit Stage/Summary row
+    @EmitInfo          bit  = 0,                    -- 0 = quiet, 1 = print progress
+    @Summary           nvarchar(4000) = NULL OUTPUT,
+    @ReturnSummaryRow  bit  = 1
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
+    SET ANSI_WARNINGS ON;
 
     DECLARE @Process       sysname      = N'ClientAbsences';
     DECLARE @RunStartedAt  datetime2(3) = SYSUTCDATETIME();
@@ -24,23 +25,18 @@ BEGIN
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
 
-    /* -----------------------
-       0) Concurrency guard
-    ------------------------*/
+    -- 0) Concurrency guard (aligned with Initial)
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:ClientAbsences';
-    DECLARE @LockOwner   sysname = N'Session';
-    DECLARE @DbPrincipal sysname = N'dbo';
-    DECLARE @lockResult  int;
-    DECLARE @lockHeld    bit = 0;
+    DECLARE @LockOwner    sysname = N'Session';
+    DECLARE @DbPrincipal  sysname = N'dbo';
+    DECLARE @lockResult   int;
+    DECLARE @lockHeld     bit = 0;
 
     IF @UseAppLock = 1
     BEGIN
         EXEC @lockResult = sys.sp_getapplock
-            @Resource    = @LockResource,
-            @LockMode    = 'Exclusive',
-            @LockOwner   = @LockOwner,
-            @DbPrincipal = @DbPrincipal,
-            @LockTimeout = @LockTimeoutMs;
+            @Resource=@LockResource, @LockMode='Exclusive',
+            @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal, @LockTimeout=@LockTimeoutMs;
 
         IF @lockResult NOT IN (0,1)
         BEGIN
@@ -53,9 +49,7 @@ BEGIN
     END
 
     BEGIN TRY
-        /* -----------------------
-           1) Preconditions & bounds
-        ------------------------*/
+        -- 1) Preconditions & bounds (consistent with Initial)
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
         BEGIN
             IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
@@ -77,7 +71,7 @@ BEGIN
         DECLARE @CT_CHSYSDEC bit =
             CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC')) THEN 1 ELSE 0 END;
 
-        IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
+        IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
             (
@@ -93,7 +87,7 @@ BEGIN
         DECLARE @LastSyncVersion bigint =
             (SELECT LastSyncVersion FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process);
 
-        -- Min valid across referenced CT-enabled tables
+        -- Min valid version across referenced CT-enabled tables
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
@@ -122,19 +116,17 @@ BEGIN
             RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
         END
 
-        /* ------------------------------------------
-           2) Build changed InactiveReference set
-        -------------------------------------------*/
+        -- 2) Build changed key set
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
         CREATE TABLE #Changed (InactiveReference nvarchar(55) NOT NULL PRIMARY KEY);
 
-        -- All operations (I/U/D) from INACTIVE_DY
+        -- INACTIVE_DY changes (I/U/D)
         INSERT INTO #Changed(InactiveReference)
         SELECT DISTINCT CAST(x.INACT_REF AS nvarchar(55))
         FROM CHANGETABLE(CHANGES dbo.INACTIVE_DY, @LastSyncVersion) x
         WHERE x.SYS_CHANGE_VERSION <= @ToVersion;
 
-        -- Optional: CHSYSDEC description changes
+        -- Optional CHSYSDEC description changes
         IF @CT_CHSYSDEC = 1
         BEGIN
             INSERT INTO #Changed(InactiveReference)
@@ -146,7 +138,7 @@ BEGIN
         END
         ELSE
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Note: CT not enabled on CHSYSDEC; AbsenceReason text updates are not tracked.', 0, 1) WITH NOWAIT;
+            IF @EmitInfo=1 RAISERROR('Note: CT not enabled on CHSYSDEC; Absence_Reason text updates are not tracked.', 0, 1) WITH NOWAIT;
         END
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
@@ -155,8 +147,8 @@ BEGIN
         IF @ToProcess = 0
         BEGIN
             UPDATE dbo.CT_Watermark
-              SET LastSyncVersion = @ToVersion, LastSyncTime = SYSUTCDATETIME()
-            WHERE ProcessName = @Process;
+              SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
+            WHERE ProcessName=@Process;
 
             SET @EndUTC = SYSUTCDATETIME();
             SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
@@ -175,9 +167,7 @@ BEGIN
             RETURN 0;
         END
 
-        /* ------------------------------------------
-           3) Chunked MERGE into dbo.tbl_ClientAbsences
-        -------------------------------------------*/
+        -- 3) Chunked MERGE into dbo.tbl_ClientAbsences (no NOLOCK; same filters as Initial)
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
@@ -193,88 +183,58 @@ BEGIN
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
-            SET DATEFIRST 1; -- Monday week
-
             ;WITH Base AS
             (
                 SELECT
-                    InactiveReference = CAST(idy.INACT_REF AS nvarchar(55)),
-                    ClientReference   = idy.CLIENT_REF,
-                    AbsenceReason     = cr.DESCRIPTION,
-                    AbsenceStartDate  = CAST(idy.START_DT AS date),
-                    AbsenceEndDate    = CAST(idy.END_DT   AS date),
-                    UpdatedLeaveDate  = CAST(idy.END_DT   AS date)
+                    UUID               = CAST(idy.INACT_REF AS nvarchar(55)),
+                    Client_UUID        = CAST(idy.CLIENT_REF AS nvarchar(55)),
+                    Absence_Reason     = cr.DESCRIPTION,
+                    Absence_Start_Date = CAST(idy.START_DT AS date),
+                    Absence_End_Date   = CAST(idy.END_DT   AS date)
                 FROM dbo.INACTIVE_DY idy
                 JOIN #Next n
                   ON n.InactiveReference = CAST(idy.INACT_REF AS nvarchar(55))
                 LEFT JOIN dbo.CHSYSDEC cr
                   ON cr.DECODE_REF = idy.REASON
-                WHERE idy.rectype NOT IN ('S','R')
+                WHERE idy.rectype NOT IN ('S','R','E')   -- aligned with Initial
             ),
             Shaped AS
             (
                 SELECT
-                    InactiveReference,
-                    ClientReference,
-                    AbsenceReason,
-                    AbsenceStartDate,
-                    AbsenceEndDate,
-                    UpdatedLeaveDate,
-                    AbsenceEndDate_Week   = CASE WHEN UpdatedLeaveDate IS NOT NULL
-                                                  THEN DATEADD(day, 1 - DATEPART(weekday, UpdatedLeaveDate), UpdatedLeaveDate)
-                                                  ELSE NULL END,
-                    AbsenceStartDate_Week = CASE WHEN AbsenceStartDate IS NOT NULL
-                                                  THEN DATEADD(day, 1 - DATEPART(weekday, AbsenceStartDate), AbsenceStartDate)
-                                                  ELSE NULL END,
-                    AbsenceEndMonth       = CASE WHEN UpdatedLeaveDate IS NOT NULL THEN MONTH(UpdatedLeaveDate) END,
-                    AbsenceStartMonth     = CASE WHEN AbsenceStartDate IS NOT NULL THEN MONTH(AbsenceStartDate) END,
-                    AbsenceEndYear        = CASE WHEN UpdatedLeaveDate IS NOT NULL THEN YEAR(UpdatedLeaveDate) END,
-                    AbsenceStartYear      = CASE WHEN AbsenceStartDate IS NOT NULL THEN YEAR(AbsenceStartDate) END,
-                    DaysOnLeave           = CASE WHEN UpdatedLeaveDate IS NOT NULL AND AbsenceStartDate IS NOT NULL
-                                                  THEN DATEDIFF(day, AbsenceStartDate, UpdatedLeaveDate)
-                                                  ELSE NULL END
+                    UUID,
+                    Client_UUID,
+                    Absence_Reason,
+                    Absence_Start_Date,
+                    Absence_End_Date
                 FROM Base
             )
             MERGE dbo.tbl_ClientAbsences AS tgt
             USING Shaped AS src
-               ON tgt.InactiveReference = src.InactiveReference
+               ON tgt.UUID = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.ClientReference       = src.ClientReference,
-                    tgt.AbsenceReason         = src.AbsenceReason,
-                    tgt.AbsenceStartDate      = src.AbsenceStartDate,
-                    tgt.AbsenceEndDate        = src.AbsenceEndDate,
-                    tgt.UpdatedLeaveDate      = src.UpdatedLeaveDate,
-                    tgt.AbsenceEndDate_Week   = src.AbsenceEndDate_Week,
-                    tgt.AbsenceStartDate_Week = src.AbsenceStartDate_Week,
-                    tgt.AbsenceEndMonth       = src.AbsenceEndMonth,
-                    tgt.AbsenceStartMonth     = src.AbsenceStartMonth,
-                    tgt.AbsenceEndYear        = src.AbsenceEndYear,
-                    tgt.AbsenceStartYear      = src.AbsenceStartYear,
-                    tgt.DaysOnLeave           = src.DaysOnLeave,
-                    tgt.UpdatedAtUTC          = @RunStartedAt
+                    tgt.Client_UUID        = src.Client_UUID,
+                    tgt.Absence_Reason     = src.Absence_Reason,
+                    tgt.Absence_Start_Date = src.Absence_Start_Date,
+                    tgt.Absence_End_Date   = src.Absence_End_Date,
+                    tgt.UpdatedAtUTC       = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
-                INSERT (InactiveReference, ClientReference, AbsenceReason,
-                        AbsenceStartDate, AbsenceEndDate, UpdatedLeaveDate,
-                        AbsenceEndDate_Week, AbsenceStartDate_Week,
-                        AbsenceEndMonth, AbsenceStartMonth,
-                        AbsenceEndYear, AbsenceStartYear, DaysOnLeave,
+                INSERT (UUID, Client_UUID, Absence_Reason,
+                        Absence_Start_Date, Absence_End_Date,
                         CreatedAtUTC, UpdatedAtUTC)
-                VALUES (src.InactiveReference, src.ClientReference, src.AbsenceReason,
-                        src.AbsenceStartDate, src.AbsenceEndDate, src.UpdatedLeaveDate,
-                        src.AbsenceEndDate_Week, src.AbsenceStartDate_Week,
-                        src.AbsenceEndMonth, src.AbsenceStartMonth,
-                        src.AbsenceEndYear, src.AbsenceStartYear, src.DaysOnLeave,
+                VALUES (src.UUID, src.Client_UUID, src.Absence_Reason,
+                        src.Absence_Start_Date, src.Absence_End_Date,
                         @RunStartedAt, @RunStartedAt)
-            WHEN NOT MATCHED BY SOURCE 
-                 AND EXISTS (SELECT 1 FROM #Next nn WHERE nn.InactiveReference = tgt.InactiveReference)
+            WHEN NOT MATCHED BY SOURCE
+                 AND EXISTS (SELECT 1 FROM #Next nn WHERE nn.InactiveReference = tgt.UUID)
                  THEN DELETE
             OUTPUT $action INTO #ActLog(Action);
 
             DECLARE @i int = 0, @u int = 0, @d int = 0;
-            SELECT @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
-                   @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END),
-                   @d = SUM(CASE WHEN Action='DELETE' THEN 1 ELSE 0 END)
+            SELECT
+                @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
+                @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END),
+                @d = SUM(CASE WHEN Action='DELETE' THEN 1 ELSE 0 END)
             FROM #ActLog;
 
             SET @TotalInserted += ISNULL(@i,0);
@@ -290,13 +250,10 @@ BEGIN
             JOIN #Next n ON n.InactiveReference = c.InactiveReference;
         END
 
-        /* ------------------------------------------
-           4) Advance watermark + build summary
-        -------------------------------------------*/
+        -- 4) Advance watermark + summary (same style as Initial)
         UPDATE dbo.CT_Watermark
-          SET LastSyncVersion = @ToVersion,
-              LastSyncTime    = SYSUTCDATETIME()
-        WHERE ProcessName = @Process;
+          SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
+        WHERE ProcessName=@Process;
 
         SET @EndUTC = SYSUTCDATETIME();
         SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
@@ -326,10 +283,11 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-        DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
-        DECLARE @num int = ERROR_NUMBER(), @sev int = ERROR_SEVERITY(), @st int = ERROR_STATE(), @lin int = ERROR_LINE(), @proc sysname = ERROR_PROCEDURE();
+        DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
+        DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
-        IF @EmitInfo=1 RAISERROR('usp_Sync_ClientAbsences_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',16,1,@num,@sev,@st,@procName,@lin,@msg);
+        IF @EmitInfo=1 RAISERROR('usp_Sync_ClientAbsences_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
+                                 16,1,@num,@sev,@st,@procName,@lin,@msg);
         SET @Summary = CONCAT(N'ClientAbsences incremental failed: ', @msg);
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;

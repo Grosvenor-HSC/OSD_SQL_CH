@@ -1,9 +1,17 @@
+USE [DOM_LIVE]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
 CREATE OR ALTER PROCEDURE dbo.usp_Sync_ClientAbsences_Initial
-    @Summary nvarchar(4000) = NULL OUTPUT   -- optional: first row text if you still want it
+    @Summary nvarchar(4000) = NULL OUTPUT   -- optional: first row text
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
+    SET ANSI_WARNINGS ON;
 
     DECLARE @Process       sysname      = N'ClientAbsences';
     DECLARE @RunStartedAt  datetime2(3) = SYSUTCDATETIME();
@@ -13,9 +21,10 @@ BEGIN
     DECLARE @lockResult    int;
     DECLARE @lockHeld      bit = 0;
 
+    -- Concurrency (wide window for baseline)
     EXEC @lockResult = sys.sp_getapplock
-        @Resource=@LockResource, @LockMode='Exclusive', @LockOwner='Session',
-        @DbPrincipal='dbo', @LockTimeout=600000;
+        @Resource=@LockResource, @LockMode='Exclusive',
+        @LockOwner='Session', @DbPrincipal='dbo', @LockTimeout=600000;
     IF @lockResult NOT IN (0,1)
     BEGIN
         SET @Summary = N'ClientAbsences initial failed: could not acquire applock.';
@@ -24,13 +33,16 @@ BEGIN
     SET @lockHeld = 1;
 
     BEGIN TRY
+        /* 1) Preconditions */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
             RAISERROR('Change Tracking is not enabled at DB level.', 16, 1);
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.INACTIVE_DY'))
             RAISERROR('Change Tracking is not enabled on dbo.INACTIVE_DY.', 16, 1);
 
+        /* 2) Fence CT window at START so incremental can top-off */
         SET @BaselineFrom = CHANGE_TRACKING_CURRENT_VERSION();
 
+        /* 3) Seed/refresh watermark to START snapshot */
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -50,65 +62,52 @@ BEGIN
             INSERT (ProcessName, LastSyncVersion, LastSyncTime)
             VALUES (S.p, S.v, SYSUTCDATETIME());
 
-        IF OBJECT_ID('[dbo].[tbl_ClientAbsences]', 'U') IS NOT NULL
-            DROP TABLE [dbo].[tbl_ClientAbsences];
+        /* 4) Recreate target */
+        IF OBJECT_ID(N'dbo.tbl_ClientAbsences', N'U') IS NOT NULL
+            DROP TABLE dbo.tbl_ClientAbsences;
 
-        CREATE TABLE [dbo].[tbl_ClientAbsences](
-            InactiveReference      nvarchar(55)  NOT NULL,
-            ClientReference        int           NULL,
-            AbsenceReason          nvarchar(255) NULL,
-            AbsenceStartDate       date          NULL,
-            AbsenceEndDate         date          NULL,
-            UpdatedLeaveDate       date          NULL,
-            AbsenceEndDate_Week    date          NULL,
-            AbsenceStartDate_Week  date          NULL,
-            AbsenceEndMonth        int           NULL,
-            AbsenceStartMonth      int           NULL,
-            AbsenceEndYear         int           NULL,
-            AbsenceStartYear       int           NULL,
-            DaysOnLeave            int           NULL,
-            CreatedAtUTC           datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientAbsences_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
-            UpdatedAtUTC           datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientAbsences_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
-            CONSTRAINT PK_tbl_ClientAbsences PRIMARY KEY CLUSTERED (InactiveReference)
+        CREATE TABLE dbo.tbl_ClientAbsences
+        (
+            UUID                 nvarchar(55)  NOT NULL,
+            Client_UUID          nvarchar(55)  NULL,
+            Absence_Reason       nvarchar(255) NULL,
+            Absence_Start_Date   date          NULL,
+            Absence_End_Date     date          NULL,
+            CreatedAtUTC         datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientAbsences_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
+            UpdatedAtUTC         datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientAbsences_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT PK_tbl_ClientAbsences PRIMARY KEY CLUSTERED (UUID)
         );
 
-        -- Baseline load
-        SET DATEFIRST 1;
-        INSERT INTO [dbo].[tbl_ClientAbsences] (
-            InactiveReference, ClientReference, AbsenceReason,
-            AbsenceStartDate, AbsenceEndDate, UpdatedLeaveDate,
-            AbsenceEndDate_Week, AbsenceStartDate_Week,
-            AbsenceEndMonth, AbsenceStartMonth, AbsenceEndYear, AbsenceStartYear,
-            DaysOnLeave, CreatedAtUTC, UpdatedAtUTC
-        )
-        SELECT 
-            CAST(IDY.INACT_REF AS nvarchar(55)),
-            IDY.CLIENT_REF,
-            CR.DESCRIPTION,
-            CAST(IDY.START_DT AS date),
-            CAST(IDY.END_DT   AS date),
-            CAST(IDY.END_DT   AS date),
-            DATEADD(day, 1 - DATEPART(weekday, CAST(IDY.END_DT   AS date)), CAST(IDY.END_DT   AS date)),
-            DATEADD(day, 1 - DATEPART(weekday, CAST(IDY.START_DT AS date)), CAST(IDY.START_DT AS date)),
-            MONTH(CAST(IDY.END_DT   AS date)),
-            MONTH(CAST(IDY.START_DT AS date)),
-            YEAR(CAST(IDY.END_DT   AS date)),
-            YEAR(CAST(IDY.START_DT AS date)),
-            DATEDIFF(day, CAST(IDY.START_DT AS date), CAST(IDY.END_DT AS date)),
-            @RunStartedAt, @RunStartedAt
-        FROM dbo.INACTIVE_DY AS IDY WITH (NOLOCK)
-        LEFT JOIN dbo.CHSYSDEC AS CR WITH (NOLOCK)
-          ON CR.DECODE_REF = IDY.REASON
-        WHERE IDY.rectype NOT IN ('S','R','E');
+        /* 5) Baseline load (dynamic SQL to avoid compile-time column binding) */
+        DECLARE @sql nvarchar(max) = N'
+INSERT INTO dbo.tbl_ClientAbsences
+( UUID, Client_UUID, Absence_Reason, Absence_Start_Date, Absence_End_Date, CreatedAtUTC, UpdatedAtUTC )
+SELECT 
+    CAST(IDY.INACT_REF  AS nvarchar(55)) AS UUID,
+    CAST(IDY.CLIENT_REF AS nvarchar(55)) AS Client_UUID,
+    CR.DESCRIPTION                     AS Absence_Reason,
+    CAST(IDY.START_DT AS date)         AS Absence_Start_Date,
+    CAST(IDY.END_DT   AS date)         AS Absence_End_Date,
+    @RunStartedAt                      AS CreatedAtUTC,
+    @RunStartedAt                      AS UpdatedAtUTC
+FROM dbo.INACTIVE_DY AS IDY
+LEFT JOIN dbo.CHSYSDEC AS CR
+       ON CR.DECODE_REF = IDY.REASON
+WHERE IDY.rectype NOT IN (''S'',''R'',''E'');';
+
+        EXEC sp_executesql @sql, N'@RunStartedAt datetime2(3)', @RunStartedAt=@RunStartedAt;
 
         DECLARE @Inserted int = @@ROWCOUNT;
 
-        -- Indexes after load
-        CREATE INDEX IX_tbl_ClientAbsences_ClientReference  ON [dbo].[tbl_ClientAbsences](ClientReference);
-        CREATE INDEX IX_tbl_ClientAbsences_AbsenceStartDate ON [dbo].[tbl_ClientAbsences](AbsenceStartDate);
-        CREATE INDEX IX_tbl_ClientAbsences_AbsenceEndDate   ON [dbo].[tbl_ClientAbsences](AbsenceEndDate);
+        /* 6) Helpful indexes (also dynamic to avoid compile-time binding) */
+        DECLARE @ix1 nvarchar(max) = N'CREATE INDEX IX_tbl_ClientAbsences_Client_UUID ON dbo.tbl_ClientAbsences (Client_UUID);';
+        DECLARE @ix2 nvarchar(max) = N'CREATE INDEX IX_tbl_ClientAbsences_Absence_Start_Date ON dbo.tbl_ClientAbsences (Absence_Start_Date);';
+        DECLARE @ix3 nvarchar(max) = N'CREATE INDEX IX_tbl_ClientAbsences_Absence_End_Date   ON dbo.tbl_ClientAbsences (Absence_End_Date);';
+        EXEC(@ix1);
+        EXEC(@ix2);
+        EXEC(@ix3);
 
-        -- Compose initial message
+        /* 7) Summaries + quiet incremental top-off */
         DECLARE @EndInitialUTC datetime2(3) = SYSUTCDATETIME();
         DECLARE @EndInitialIso varchar(33)  = CONVERT(varchar(33), @EndInitialUTC, 126);
         DECLARE @InitialMsg nvarchar(4000) =
@@ -116,9 +115,8 @@ BEGIN
                    N' UTC; ended ', @EndInitialIso,
                    N' UTC; baseline inserted ', @Inserted, N' rows.');
 
-        -- Immediately run incremental QUIETLY and capture its summary
         DECLARE @IncrMsg nvarchar(4000) = N'Incremental skipped.';
-        IF OBJECT_ID('dbo.usp_Sync_ClientAbsences_Incremental','P') IS NOT NULL
+        IF OBJECT_ID(N'dbo.usp_Sync_ClientAbsences_Incremental', N'P') IS NOT NULL
         BEGIN
             DECLARE @rc int;
             EXEC @rc = dbo.usp_Sync_ClientAbsences_Incremental
@@ -126,14 +124,13 @@ BEGIN
                 @EmitInfo=0, @Summary=@IncrMsg OUTPUT;
             IF (@rc < 0)
                 SET @IncrMsg = CONCAT(@IncrMsg, N' (rc=', @rc, N')');
-        END
+        END;
 
         SET @Summary = @InitialMsg;
 
-        -- Return exactly two rows
-        SELECT 'Initial'     AS Stage, @InitialMsg AS Summary
+        SELECT 'Initial' AS Stage,     @InitialMsg AS Summary
         UNION ALL
-        SELECT 'Incremental' AS Stage, @IncrMsg;
+        SELECT 'Incremental',          @IncrMsg;
 
         IF @lockHeld=1
             EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner='Session', @DbPrincipal='dbo';
@@ -141,7 +138,8 @@ BEGIN
         RETURN 0;
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner='Session', @DbPrincipal='dbo';
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner='Session', @DbPrincipal='dbo';
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         SET @Summary = CONCAT(N'ClientAbsences initial failed: ', @msg);
         RETURN -50001;
