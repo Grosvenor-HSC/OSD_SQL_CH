@@ -248,7 +248,7 @@ BEGIN
         )
         SELECT
             f.Employee_UUID, f.Branch_UUID, f.Start_Date, f.End_Date,
-            f.[Status], f.[Group], f.Left_Reason, f.[Location],
+            f.[Status], NULLIF(f.[Group], ''), NULLIF(f.Left_Reason, ''), NULLIF(f.[Location], ''),
             f.Main_Branch, f.Branch_Name,
             @RunStartedAt, @RunStartedAt
         FROM FinalAgg f;

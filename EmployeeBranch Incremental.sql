@@ -389,9 +389,9 @@ BEGIN
                     CASE WHEN SUM(CASE WHEN s.End_Date IS NULL THEN 1 ELSE 0 END) > 0
                          THEN NULL ELSE MAX(s.End_Date) END AS End_Date,
                     MAX(COALESCE(s.[Status],     N'')) AS [Status],
-                    MAX(COALESCE(s.[Group],      N'')) AS [Group],
-                    MAX(COALESCE(s.Left_Reason,  N'')) AS Left_Reason,
-                    MAX(COALESCE(s.[Location],   N'')) AS [Location],
+                    MAX(NULLIF(COALESCE(s.[Group], N''), N'')) AS [Group],
+                    MAX(NULLIF(COALESCE(s.Left_Reason, N''), N'')) AS Left_Reason,
+                    MAX(NULLIF(COALESCE(s.[Location],   N''), N'')) AS [Location],
                     MAX(COALESCE(s.Main_Branch,   'N')) AS Main_Branch,  -- 'Y' beats 'N'
                     MAX(COALESCE(s.Branch_Name,  N'')) AS Branch_Name
                 FROM Shaped s

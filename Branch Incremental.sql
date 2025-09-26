@@ -169,27 +169,31 @@ BEGIN
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
             ;WITH Base AS
-            (
-                SELECT
-                    UUID = CAST(LOWER(master.dbo.fn_varbintohexstr(HASHBYTES('SHA1',
-                                CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-                                     WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                                     ELSE gs.NAME END))) AS VARCHAR(42)),
-                    Branch_Name     = CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-                                           WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                                           ELSE LTRIM(RTRIM(gs.NAME)) END,
-                    Brand           = CAST(LTRIM(RTRIM(gs.VATREG))   AS NVARCHAR(100)),
-                    Active          = CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)),
-                    Early_Pay_Rate  = CAST(LTRIM(RTRIM(ep.LowestBasicRate)) AS DECIMAL(10,2)),
-                    Old_Branch_UUID = CAST(LTRIM(RTRIM(gs.GS_REF))   AS VARCHAR(20))
-                FROM dbo.GLOB_SITE gs
-                JOIN #Next n ON n.GS_REF = gs.GS_REF
-                LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = (
+(
+    SELECT
+        UUID = LOWER(CONVERT(VARCHAR(40),
+                 HASHBYTES('SHA1',
                     CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
                          WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                         ELSE gs.NAME END
-                )
-            )
+                         ELSE LTRIM(RTRIM(gs.NAME))
+                    END
+                 ), 2)),
+        Branch_Name     = CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+                               WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+                               ELSE LTRIM(RTRIM(gs.NAME)) END,
+        Brand           = NULLIF(CAST(LTRIM(RTRIM(gs.VATREG))   AS NVARCHAR(100)), ''),
+        Active          = NULLIF(CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)), ''),
+        Early_Pay_Rate  = NULLIF(TRY_CONVERT(DECIMAL(10,2), ep.LowestBasicRate), 0),
+        Old_Branch_UUID = NULLIF(CAST(LTRIM(RTRIM(gs.GS_REF))   AS VARCHAR(20)), '')
+    FROM dbo.GLOB_SITE gs
+    JOIN #Next n ON n.GS_REF = gs.GS_REF
+    LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = (
+        CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
+             WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
+             ELSE gs.NAME
+        END
+    )
+)
             MERGE dbo.tbl_Branch AS tgt
             USING Base AS src
                ON tgt.UUID = src.UUID

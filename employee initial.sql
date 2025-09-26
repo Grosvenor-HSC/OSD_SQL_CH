@@ -102,20 +102,20 @@ BEGIN
                            ELSE 'Unknown' END                    AS Gender,
                 CHD.FORENAMES                                    AS Forenames,
                 CHD.SURNAME                                      AS Surname,
-                CHD.TEL_NO1                                      AS Telephone_Number,
-                E.PAYROLL_NO                                     AS Payroll_Number,
-                CHD.EMAIL                                        AS Email,
+                nullif(CHD.TEL_NO1, '')                         AS Telephone_Number,
+                nullif(E.PAYROLL_NO, '')                        AS Payroll_Number,
+                nullif(CHD.EMAIL, '')                           AS Email,
                 CEE.DESCRIPTION                                  AS Ethnicity,
-                CER.DESCRIPTION                                  AS Religion,
+                nullif(nullif(CER.DESCRIPTION, 'Not Declared'), '<no selection>')                     AS Religion,
                 CEJT.DESCRIPTION                                 AS Job_Title,
-                JQ.DESCRIPTION                                   AS Salaried,
+                nullif(JQ.DESCRIPTION, '<no selection>')                       AS Salaried,
                 E.INTERFACE                                      AS Payroll_Schedule,   -- <— alias matches table column
                 E.DRIVER                                         AS Driver,
-                CHD.ADDRESS1                                     AS First_Line_Address,
-                CHD.ADDRESS2                                     AS Second_Line_Address,
-                CHD.ADDRESS3                                     AS Third_Line_Address,
-                CHD.ADDRESS4                                     AS Fourth_Line_Address,
-                CHD.POSTCODE                                     AS Postcode
+                nullif(CHD.ADDRESS1, '')                        AS First_Line_Address,
+                nullif(CHD.ADDRESS2, '')                        AS Second_Line_Address,
+                nullif(CHD.ADDRESS3, '')                        AS Third_Line_Address,
+                nullif(CHD.ADDRESS4, '')                        AS Fourth_Line_Address,
+                nullif(CHD.POSTCODE, '')                        AS Postcode
             FROM dbo.EMPLOYEE      AS E
             LEFT JOIN dbo.CONTACT_DT AS CDT ON CDT.CNTA_DET_REF = E.CNTA_DET_REF
             LEFT JOIN dbo.CONTACT_HD AS CHD ON CHD.CONTACT_REF  = CDT.CONTACT_REF

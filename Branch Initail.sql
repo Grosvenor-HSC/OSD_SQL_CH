@@ -88,33 +88,34 @@ BEGIN
         CREATE NONCLUSTERED INDEX IX_tbl_Branch_OldBranchUID       ON dbo.tbl_Branch (Old_Branch_UUID);
 
         /* =========
-           Baseline insert via dynamic SQL to avoid compile-time binding to any pre-existing table shape
+           Baseline insert via dynamic SQL
            ========= */
         DECLARE @sql nvarchar(max) = N'
 ;WITH Base AS
 (
     SELECT
         Branch_Name = CASE
-                          WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
-                          WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
+                          WHEN gs.GS_REF = ''1970000043'' THEN N''Southampton''
+                          WHEN gs.GS_REF = ''1970000069'' THEN N''Old_Southampton''
                           ELSE LTRIM(RTRIM(gs.NAME))
                       END,
-        Brand           = CAST(LTRIM(RTRIM(gs.VATREG)) AS NVARCHAR(100)),
-        Active          = CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)),
-        Early_Pay_Rate  = CAST(LTRIM(RTRIM(ep.LowestBasicRate)) AS DECIMAL(10,2)),
-        Old_Branch_UUID = CAST(LTRIM(RTRIM(gs.GS_REF)) AS VARCHAR(20)),
-        UUID = CAST(LOWER(master.dbo.fn_varbintohexstr(
-                    HASHBYTES(''SHA1'',
-                        CASE
-                            WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
-                            WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
-                            ELSE gs.NAME
-                        END))) AS VARCHAR(42))
+        Brand           = NULLIF(CAST(LTRIM(RTRIM(gs.VATREG))       AS NVARCHAR(100)), ''''),
+        Active          = NULLIF(CAST(LTRIM(RTRIM(gs.NHS_DEPT))     AS NVARCHAR(20)),  ''''),
+        Early_Pay_Rate  = NULLIF(TRY_CONVERT(DECIMAL(10,2), ep.LowestBasicRate), 0),
+        Old_Branch_UUID = NULLIF(CAST(LTRIM(RTRIM(gs.GS_REF))       AS VARCHAR(20)),   ''''),
+        UUID = LOWER(CONVERT(VARCHAR(40),
+                 HASHBYTES(''SHA1'',
+                    CASE
+                        WHEN gs.GS_REF = ''1970000043'' THEN N''Southampton''
+                        WHEN gs.GS_REF = ''1970000069'' THEN N''Old_Southampton''
+                        ELSE LTRIM(RTRIM(gs.NAME))
+                    END
+                 ), 2))
     FROM dbo.GLOB_SITE gs
     LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep
            ON ep.Branch = CASE
-                              WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
-                              WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
+                              WHEN gs.GS_REF = ''1970000043'' THEN N''Southampton''
+                              WHEN gs.GS_REF = ''1970000069'' THEN N''Old_Southampton''
                               ELSE gs.NAME
                           END
 )
@@ -124,8 +125,7 @@ INSERT INTO dbo.tbl_Branch
 )
 SELECT
     UUID, Branch_Name, Brand, Active, Early_Pay_Rate, Old_Branch_UUID, @RunStartedAt, @RunStartedAt
-FROM Base;
-';
+FROM Base;';
         DECLARE @params nvarchar(200) = N'@RunStartedAt datetime2(3)';
         EXEC sp_executesql @sql, @params, @RunStartedAt=@RunStartedAt;
 

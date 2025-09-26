@@ -43,7 +43,7 @@ BEGIN
 
         IF @lockResult NOT IN (0,1)
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Could not acquire %s (sp_getapplock rc=%d).',16,1,@LockResource,@lockResult);
+            IF @EmitInfo=1 RAISERROR('Could not acquire %s (sp_getapplock rc=%d).', 0, 1, @LockResource, @lockResult);
             SET @Summary = N'Employees incremental failed: could not acquire applock.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             RETURN @lockResult;
@@ -55,7 +55,7 @@ BEGIN
         /* 1) Preconditions & bounds */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
+            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at the database level.', 0, 1);
             SET @Summary = N'Employees incremental failed: CT not enabled at DB level.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             SET @ret = -100; GOTO FinallyRelease;
@@ -63,7 +63,7 @@ BEGIN
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.EMPLOYEE'))
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.EMPLOYEE.',16,1);
+            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.EMPLOYEE.', 0, 1);
             SET @Summary = N'Employees incremental failed: CT not enabled on dbo.EMPLOYEE.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             SET @ret = -210; GOTO FinallyRelease;
@@ -73,7 +73,7 @@ BEGIN
         DECLARE @CT_CONTACT_HD bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CONTACT_HD')) THEN 1 ELSE 0 END;
         DECLARE @CT_CHSYSDEC   bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC'))   THEN 1 ELSE 0 END;
 
-        -- Watermark
+        -- Watermark table/row
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -103,7 +103,7 @@ BEGIN
 
         IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
+            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.', 0, 1, @LastSyncVersion, @MinValid);
             SET @Summary = CONCAT(N'Employees incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N' (re-baseline).');
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             SET @ret = -200; GOTO FinallyRelease;
@@ -157,18 +157,17 @@ BEGIN
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on CONTACT_HD; header changes not captured.', 0, 1) WITH NOWAIT;
 
-        -- CHSYSDEC (opt)
+        -- CHSYSDEC (opt) — only decodes we actually project
         IF @CT_CHSYSDEC = 1
         BEGIN
             INSERT INTO #Changed(UUID)
             SELECT DISTINCT e.EMP_REF
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) d
             JOIN dbo.EMPLOYEE e
-              ON e.ETHNICITY    = d.DECODE_REF
-              OR e.RELORG_REF   = d.DECODE_REF
-              OR e.JOBTITLE     = d.DECODE_REF
-              OR e.LOCATION_REF = d.DECODE_REF
-              OR e.JOB_QUAL     = d.DECODE_REF
+              ON e.ETHNICITY  = d.DECODE_REF
+              OR e.RELORG_REF = d.DECODE_REF
+              OR e.JOBTITLE   = d.DECODE_REF
+              OR e.JOB_QUAL   = d.DECODE_REF
             WHERE d.SYS_CHANGE_VERSION <= @ToVersion
               AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = e.EMP_REF);
         END
@@ -225,22 +224,24 @@ BEGIN
                                                     WHEN 'F' THEN 'Female'
                                                     WHEN 'N' THEN 'Not Applicable'
                                                     ELSE 'Unknown' END,
-                    Forenames           = CHD.FORENAMES,
-                    Surname             = CHD.SURNAME,
-                    Telephone_Number    = CHD.TEL_NO1,
-                    Payroll_Number      = E.PAYROLL_NO,
-                    Email               = CHD.EMAIL,
-                    Ethnicity           = CEE.DESCRIPTION,
-                    Religion            = CER.DESCRIPTION,
-                    Job_Title           = CEJT.DESCRIPTION,
-                    Salaried            = JQ.DESCRIPTION,
-                    Payroll_Schedule    = E.INTERFACE,
+                    Forenames           = NULLIF(LTRIM(RTRIM(CHD.FORENAMES)), ''),
+                    Surname             = NULLIF(LTRIM(RTRIM(CHD.SURNAME)), ''),
+                    Telephone_Number    = NULLIF(LTRIM(RTRIM(CHD.TEL_NO1)), ''),
+                    Payroll_Number      = NULLIF(LTRIM(RTRIM(E.PAYROLL_NO)), ''),
+                    Email               = NULLIF(LTRIM(RTRIM(CHD.EMAIL)), ''),
+                    Ethnicity           = NULLIF(LTRIM(RTRIM(CEE.DESCRIPTION)), ''),
+                    Religion            = CASE WHEN LTRIM(RTRIM(CER.DESCRIPTION)) = 'Not Declared' THEN NULL
+                                               ELSE nullif(NULLIF(LTRIM(RTRIM(CER.DESCRIPTION)), ''), '<no selection>') END,
+                    Job_Title           = NULLIF(LTRIM(RTRIM(CEJT.DESCRIPTION)), ''),
+                    Salaried            = CASE WHEN LTRIM(RTRIM(JQ.DESCRIPTION)) = '<no selection>' THEN NULL
+                                               ELSE NULLIF(LTRIM(RTRIM(JQ.DESCRIPTION)), '') END,
+                    Payroll_Schedule    = NULLIF(LTRIM(RTRIM(E.INTERFACE)), ''),
                     Driver              = E.DRIVER,
-                    First_Line_Address  = CHD.ADDRESS1,
-                    Second_Line_Address = CHD.ADDRESS2,
-                    Third_Line_Address  = CHD.ADDRESS3,
-                    Fourth_Line_Address = CHD.ADDRESS4,
-                    Postcode            = CHD.POSTCODE
+                    First_Line_Address  = NULLIF(LTRIM(RTRIM(CHD.ADDRESS1)), ''),
+                    Second_Line_Address = NULLIF(LTRIM(RTRIM(CHD.ADDRESS2)), ''),
+                    Third_Line_Address  = NULLIF(LTRIM(RTRIM(CHD.ADDRESS3)), ''),
+                    Fourth_Line_Address = NULLIF(LTRIM(RTRIM(CHD.ADDRESS4)), ''),
+                    Postcode            = NULLIF(LTRIM(RTRIM(CHD.POSTCODE)), '')
                 FROM dbo.EMPLOYEE E
                 JOIN #Next n                 ON n.UUID           = E.EMP_REF
                 LEFT JOIN dbo.CONTACT_DT CDT ON CDT.CNTA_DET_REF = E.CNTA_DET_REF
@@ -301,7 +302,7 @@ BEGIN
             SET @TotalUpdated  += ISNULL(@u,0);
 
             IF @EmitInfo=1
-                RAISERROR('Employees chunk: inserted=%d updated=%d (running %d/%d)', 0,1,@i,@u,@TotalInserted,@TotalUpdated) WITH NOWAIT;
+                RAISERROR('Employees chunk: inserted=%d updated=%d (running %d/%d)', 0, 1, @i, @u, @TotalInserted, @TotalUpdated) WITH NOWAIT;
 
             DELETE c
             FROM #Changed c
@@ -357,7 +358,7 @@ FinallyRelease:
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
-        IF @EmitInfo=1 RAISERROR('usp_Sync_Employees_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',16,1,@num,@sev,@st,@procName,@lin,@msg);
+        IF @EmitInfo=1 RAISERROR('usp_Sync_Employees_Incremental failed (%d, sev %d, state %d) at %s line %d: %s', 16, 1, @num, @sev, @st, @procName, @lin, @msg);
         SET @Summary = CONCAT(N'Employees incremental failed: ', @msg);
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;
