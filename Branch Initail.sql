@@ -97,12 +97,12 @@ BEGIN
         Branch_Name = CASE
                           WHEN gs.GS_REF=''1970000043'' THEN N''Southampton''
                           WHEN gs.GS_REF=''1970000069'' THEN N''Old_Southampton''
-                          ELSE gs.NAME
+                          ELSE LTRIM(RTRIM(gs.NAME))
                       END,
-        Brand           = CAST(gs.VATREG   AS NVARCHAR(100)),
-        Active          = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
-        Early_Pay_Rate  = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
-        Old_Branch_UUID = CAST(gs.GS_REF   AS VARCHAR(20)),
+        Brand           = CAST(LTRIM(RTRIM(gs.VATREG)) AS NVARCHAR(100)),
+        Active          = CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)),
+        Early_Pay_Rate  = CAST(LTRIM(RTRIM(ep.LowestBasicRate)) AS DECIMAL(10,2)),
+        Old_Branch_UUID = CAST(LTRIM(RTRIM(gs.GS_REF)) AS VARCHAR(20)),
         UUID = CAST(LOWER(master.dbo.fn_varbintohexstr(
                     HASHBYTES(''SHA1'',
                         CASE

@@ -92,9 +92,7 @@ BEGIN
         END
 
         IF @EmitInfo=1
-        BEGIN
             RAISERROR('Clients CT window: From=%I64d To=%I64d',0,1,@LastSyncVersion,@ToVersion) WITH NOWAIT;
-        END
 
         -- Build changed set
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
@@ -209,28 +207,28 @@ BEGIN
             ;WITH BaseClient AS
             (
                 SELECT
-                    -- Branch mapping (name override for GS_REF=1970000043 else by Old_Branch_UUID)
+                    -- Branch mapping (Southampton/Portsmouth override for GS_REF=1970000043; else by Old_Branch_UUID)
                     Branch_UUID = COALESCE(b_by_name.UUID, b_by_old.UUID),
 
                     UUID        = CAST(C.CLIENT_REF AS varchar(50)),
-                    Case_No     = C.CASE_NO,
-                    DOB         = C.DATEOFBIRTH,
+                    Case_No     = NULLIF(LTRIM(RTRIM(C.CASE_NO)), ''),
+                    DOB         = C.DATEOFBIRTH,  -- keep as DATE; initial handles empty-string cases if present
 
-                    First_Line_Address  = LTRIM(RTRIM(CHD.ADDRESS1)),
-                    Second_Line_Address = LTRIM(RTRIM(CHD.ADDRESS2)),
-                    Third_Line_Address  = LTRIM(RTRIM(CHD.ADDRESS3)),
-                    Fourth_Line_Address = LTRIM(RTRIM(CHD.ADDRESS4)),
+                    First_Line_Address  = NULLIF(LTRIM(RTRIM(CHD.ADDRESS1)), ''),
+                    Second_Line_Address = NULLIF(LTRIM(RTRIM(CHD.ADDRESS2)), ''),
+                    Third_Line_Address  = NULLIF(LTRIM(RTRIM(CHD.ADDRESS3)), ''),
+                    Fourth_Line_Address = NULLIF(LTRIM(RTRIM(CHD.ADDRESS4)), ''),
 
-                    Postcode    = CHD.POSTCODE,
-                    Forenames   = CHD.FORENAMES,
-                    Surname     = CHD.SURNAME,
-                    Email       = CHD.EMAIL,
-                    Telephone_1 = CHD.TEL_NO1,
-                    Telephone_2 = CHD.TEL_NO2,
+                    Postcode    = NULLIF(LTRIM(RTRIM(CHD.POSTCODE)), ''),
+                    Forenames   = NULLIF(LTRIM(RTRIM(CHD.FORENAMES)), ''),
+                    Surname     = NULLIF(LTRIM(RTRIM(CHD.SURNAME)), ''),
+                    Email       = NULLIF(LTRIM(RTRIM(CHD.EMAIL)), ''),
+                    Telephone_1 = NULLIF(LTRIM(RTRIM(CHD.TEL_NO1)), ''),
+                    Telephone_2 = NULLIF(LTRIM(RTRIM(CHD.TEL_NO2)), ''),
 
-                    Title       = CTL.DESCRIPTION,
-                    [Group]     = CG.DESCRIPTION,
-                    CH_Code     = C.CLIENT_CODE,
+                    Title       = NULLIF(LTRIM(RTRIM(CTL.DESCRIPTION)), ''),
+                    [Group]     = NULLIF(LTRIM(RTRIM(CG.DESCRIPTION)), ''),
+                    CH_Code     = NULLIF(LTRIM(RTRIM(C.CLIENT_CODE)), ''),
 
                     Gender      = CASE WHEN C.SEX='M' THEN 'Male'
                                        WHEN C.SEX='F' THEN 'Female'
@@ -239,17 +237,17 @@ BEGIN
                     StartDate   = C.START_DATE,
                     LeaveDate   = C.LEFT_DATE,
 
-                    Status        = CSE.DESCRIPTION,
-                    Disability_1  = CD1.DESCRIPTION,
-                    Disability_2  = CD2.DESCRIPTION,
-                    Disability_3  = CD3.DESCRIPTION,
-                    Ethnicity     = CE.DESCRIPTION,
-                    LeftReason    = CLR.DESCRIPTION,
-                    Religion      = CR.DESCRIPTION,
-                    Location      = CL.DESCRIPTION,
-                    Type          = CTY.DESCRIPTION,
+                    Status        = LTRIM(RTRIM(CSE.DESCRIPTION)),
+                    Disability_1  = CASE WHEN LTRIM(RTRIM(CD1.DESCRIPTION)) = '<no selection>' THEN NULL ELSE LTRIM(RTRIM(CD1.DESCRIPTION)) END,
+                    Disability_2  = CASE WHEN LTRIM(RTRIM(CD2.DESCRIPTION)) = '<no selection>' THEN NULL ELSE LTRIM(RTRIM(CD2.DESCRIPTION)) END,
+                    Disability_3  = CASE WHEN LTRIM(RTRIM(CD3.DESCRIPTION)) = '<no selection>' THEN NULL ELSE LTRIM(RTRIM(CD3.DESCRIPTION)) END,
+                    Ethnicity     = LTRIM(RTRIM(CE.DESCRIPTION)),
+                    LeftReason    = CASE WHEN LTRIM(RTRIM(CLR.DESCRIPTION)) = '<no selection>' THEN NULL ELSE LTRIM(RTRIM(CLR.DESCRIPTION)) END,
+                    Religion      = CASE WHEN LTRIM(RTRIM(CR.DESCRIPTION))  = 'Not Declared'   THEN NULL ELSE LTRIM(RTRIM(CR.DESCRIPTION))  END,
+                    Location      = CASE WHEN LTRIM(RTRIM(CL.DESCRIPTION))  = '<no selection>' THEN NULL ELSE LTRIM(RTRIM(CL.DESCRIPTION))  END,
+                    Type          = NULLIF(LTRIM(RTRIM(CTY.DESCRIPTION)), ''),
 
-                    External_Reference = C.EXTCLREF
+                    External_Reference = NULLIF(LTRIM(RTRIM(C.EXTCLREF)), '')
                 FROM dbo.CLIENT AS C
                 JOIN #Next n                               ON n.ClientRef = CAST(C.CLIENT_REF AS varchar(50))
 
@@ -282,7 +280,7 @@ BEGIN
 
                 LEFT JOIN dbo.tbl_Branch AS b_by_old
                   ON pick.BranchName IS NULL
-                 AND b_by_old.Old_Branch_UUID = CAST(C.GS_REF AS varchar(20))
+                 AND b_by_old.Old_Branch_UUID = CAST(LTRIM(RTRIM(C.GS_REF)) AS varchar(20))
             )
             MERGE dbo.tbl_Clients AS tgt
             USING (

@@ -84,7 +84,7 @@ SELECT
     CAST(CDY.CLIENT_REF AS varchar(20))   AS Client_UUID,
     CAST(CDY.CL_DY_REF  AS varchar(20))   AS UUID,
     CDY.ENTRY_DATE                         AS Client_Diary_Entry_Date,
-    CET.DESCRIPTION                        AS Client_Diary_Entry_Type,
+    ltrim(rtrim(CET.DESCRIPTION))         AS Client_Diary_Entry_Type,
     CDY.ENTRY_TEXT                         AS Client_Diary_Entry_Text,
     @RunStartedAt                          AS CreatedAtUTC,
     @RunStartedAt                          AS UpdatedAtUTC

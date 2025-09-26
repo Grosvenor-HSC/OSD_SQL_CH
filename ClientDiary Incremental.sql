@@ -229,7 +229,7 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
                     Client_UUID           = CAST(cdy.CLIENT_REF AS varchar(20)),
                     UUID      = CAST(cdy.CL_DY_REF  AS varchar(20)),
                     Client_Diary_Entry_Date      = cdy.ENTRY_DATE,
-                    Client_Diary_Entry_Type      = cet.DESCRIPTION,
+                    Client_Diary_Entry_Type      = ltrim(rtrim(cet.DESCRIPTION)),
                     Client_Diary_Entry_Text      = cdy.ENTRY_TEXT
                 FROM dbo.CLIENT_DY cdy
                 JOIN #Next n

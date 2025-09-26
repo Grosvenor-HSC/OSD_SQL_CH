@@ -6,7 +6,7 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 CREATE OR ALTER PROCEDURE [dbo].[usp_Sync_Branch_Incremental]
-    @ChunkSize      int  = 50000,      -- branches are tiny, but keep batching
+    @ChunkSize      int  = 50000,
     @LockTimeoutMs  int  = 60000,
     @UseAppLock     bit  = 1,
     @Summary        nvarchar(4000) = NULL OUTPUT
@@ -177,11 +177,11 @@ BEGIN
                                      ELSE gs.NAME END))) AS VARCHAR(42)),
                     Branch_Name     = CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
                                            WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                                           ELSE gs.NAME END,
-                    Brand           = CAST(gs.VATREG   AS NVARCHAR(100)),
-                    Active          = CAST(gs.NHS_DEPT AS NVARCHAR(20)),
-                    Early_Pay_Rate  = CAST(ep.LowestBasicRate AS DECIMAL(10,2)),
-                    Old_Branch_UUID = CAST(gs.GS_REF   AS VARCHAR(20))
+                                           ELSE LTRIM(RTRIM(gs.NAME)) END,
+                    Brand           = CAST(LTRIM(RTRIM(gs.VATREG))   AS NVARCHAR(100)),
+                    Active          = CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)),
+                    Early_Pay_Rate  = CAST(LTRIM(RTRIM(ep.LowestBasicRate)) AS DECIMAL(10,2)),
+                    Old_Branch_UUID = CAST(LTRIM(RTRIM(gs.GS_REF))   AS VARCHAR(20))
                 FROM dbo.GLOB_SITE gs
                 JOIN #Next n ON n.GS_REF = gs.GS_REF
                 LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = (
@@ -228,7 +228,7 @@ BEGIN
         OUTPUT DELETED.UUID INTO #DelLog(UUID)
         FROM dbo.tbl_Branch t
         JOIN (
-            SELECT d.GS_REF
+            SELECT CAST(LTRIM(RTRIM(d.GS_REF)) AS VARCHAR(20)) AS GS_REF
             FROM CHANGETABLE(CHANGES dbo.GLOB_SITE, @LastSyncVersion) d
             WHERE d.SYS_CHANGE_OPERATION='D'
               AND d.SYS_CHANGE_VERSION<=@ToVersion
