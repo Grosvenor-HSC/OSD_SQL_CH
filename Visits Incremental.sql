@@ -177,7 +177,7 @@ BEGIN
                 LEFT JOIN dbo.SERVICE_HD   AS SHD ON AHD.SERVICE_REF  = SHD.SERVICE_REF
                 LEFT JOIN dbo.CAREPLAN_DT  AS CPDT ON AHD.CPLAN_DET_REF = CPDT.CPLAN_DET_REF
                 WHERE AHD.[TYPE] <> 1
-                AND AHD.START_DTM >= DATEADD(MONTH, -6, SYSUTCDATETIME()) 
+                AND AHD.START_DTM >= DATEADD(year, -3, SYSUTCDATETIME()) 
             )
             MERGE dbo.tbl_Visits AS tgt
             USING (SELECT * FROM VisitsBase) AS src

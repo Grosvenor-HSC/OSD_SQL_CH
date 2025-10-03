@@ -5,7 +5,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-ALTER PROCEDURE [dbo].[usp_Sync_ClientDiary_Incremental]
+CREATE OR ALTER PROCEDURE [dbo].[usp_Sync_ClientDiary_Incremental]
     @ChunkSize         int  = 100000,
     @LockTimeoutMs     int  = 60000,
     @UseAppLock        bit  = 1,
@@ -118,8 +118,13 @@ BEGIN
 
         -- 2) Build changed key set
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (ClientRef varchar(20) NOT NULL, DiaryRef varchar(20) NOT NULL, CONSTRAINT PK_Changed PRIMARY KEY (ClientRef, DiaryRef));
+        CREATE TABLE #Changed (
+            ClientRef varchar(20) NOT NULL,
+            DiaryRef  varchar(20) NOT NULL,
+            CONSTRAINT PK_Changed PRIMARY KEY (ClientRef, DiaryRef)
+        );
 
+        -- Build dynamic join to CLIENT_DY PK for CHANGETABLE join
         DECLARE @JoinPK nvarchar(max);
         ;WITH pk AS (
             SELECT c.name AS colname, ic.key_ordinal
@@ -153,6 +158,7 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
 
         EXEC sp_executesql @sql, N'@fromV bigint, @toV bigint', @fromV=@LastSyncVersion, @toV=@ToVersion;
 
+        -- Track entry-type description changes when CT is enabled on CHSYSDEC
         IF @CT_CET = 1
         BEGIN
             INSERT INTO #Changed(ClientRef, DiaryRef)
@@ -213,7 +219,11 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next (ClientRef varchar(20) NOT NULL, DiaryRef varchar(20) NOT NULL, CONSTRAINT PK_Next PRIMARY KEY (ClientRef, DiaryRef));
+            CREATE TABLE #Next (
+                ClientRef varchar(20) NOT NULL,
+                DiaryRef  varchar(20) NOT NULL,
+                CONSTRAINT PK_Next PRIMARY KEY (ClientRef, DiaryRef)
+            );
 
             INSERT INTO #Next(ClientRef, DiaryRef)
             SELECT TOP (@ChunkSize) ClientRef, DiaryRef
@@ -226,11 +236,11 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             ;WITH Base AS
             (
                 SELECT
-                    Client_UUID           = CAST(cdy.CLIENT_REF AS varchar(20)),
-                    UUID      = CAST(cdy.CL_DY_REF  AS varchar(20)),
-                    Client_Diary_Entry_Date      = cdy.ENTRY_DATE,
-                    Client_Diary_Entry_Type      = ltrim(rtrim(cet.DESCRIPTION)),
-                    Client_Diary_Entry_Text      = cdy.ENTRY_TEXT
+                    Client_UUID                = CAST(cdy.CLIENT_REF AS varchar(20)),
+                    UUID                        = CAST(cdy.CL_DY_REF  AS varchar(20)),
+                    Client_Diary_Entry_Date     = cdy.ENTRY_DATE,
+                    Client_Diary_Entry_Type     = LTRIM(RTRIM(cet.DESCRIPTION)),
+                    Client_Diary_Entry_Text     = cdy.ENTRY_TEXT
                 FROM dbo.CLIENT_DY cdy
                 JOIN #Next n
                   ON n.ClientRef = CAST(cdy.CLIENT_REF AS varchar(20))
@@ -243,14 +253,14 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             )
             MERGE dbo.tbl_ClientDiary AS tgt
             USING Base AS src
-              ON  tgt.ClientReference      = src.ClientReference
-              AND tgt.ClientDiaryReference = src.ClientDiaryReference
+              ON  tgt.Client_UUID = src.Client_UUID
+              AND tgt.UUID        = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.Client_Diary_Entry_Date      = src.Client_Diary_Entry_Date,
-                    tgt.Client_Diary_Entry_Type      = src.Client_Diary_Entry_Type,
-                    tgt.Client_Diary_Entry_Text      = src.Client_Diary_Entry_Text,
-                    tgt.UpdatedAtUTC              = @RunStartedAt
+                    tgt.Client_Diary_Entry_Date = src.Client_Diary_Entry_Date,
+                    tgt.Client_Diary_Entry_Type = src.Client_Diary_Entry_Type,
+                    tgt.Client_Diary_Entry_Text = src.Client_Diary_Entry_Text,
+                    tgt.UpdatedAtUTC            = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (
                     Client_UUID, UUID,
@@ -263,7 +273,12 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
                     @RunStartedAt, @RunStartedAt
                 )
             WHEN NOT MATCHED BY SOURCE
-                 AND EXISTS (SELECT 1 FROM #Next nn WHERE nn.ClientRef = tgt.ClientReference AND nn.DiaryRef = tgt.ClientDiaryReference)
+                 AND EXISTS (
+                     SELECT 1
+                     FROM #Next nn
+                     WHERE nn.ClientRef = tgt.Client_UUID
+                       AND nn.DiaryRef  = tgt.UUID
+                 )
                  THEN DELETE
             OUTPUT $action INTO #ActLog(Action);
 
@@ -293,9 +308,9 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             CREATE TABLE #DelLog (ClientRef varchar(20) NOT NULL);
 
             DELETE tgt
-            OUTPUT DELETED.ClientReference INTO #DelLog(ClientRef)
+            OUTPUT DELETED.Client_UUID INTO #DelLog(ClientRef)
             FROM dbo.tbl_ClientDiary tgt
-            JOIN #ClientsToPurge p ON p.ClientRef = tgt.ClientReference;
+            JOIN #ClientsToPurge p ON p.ClientRef = tgt.Client_UUID;
 
             DECLARE @Purged int = (SELECT COUNT(*) FROM #DelLog);
             SET @TotalDeleted += @Purged;

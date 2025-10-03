@@ -19,7 +19,7 @@ BEGIN
     DECLARE @lockResult    int;
     DECLARE @lockHeld      bit          = 0;
 
-    -- Applock (wide window for baseline)
+    -- Concurrency (wide window for baseline)
     EXEC @lockResult = sys.sp_getapplock
         @Resource=@LockResource, @LockMode='Exclusive',
         @LockOwner='Session', @DbPrincipal='dbo', @LockTimeout=600000;
@@ -27,7 +27,7 @@ BEGIN
     BEGIN
         SELECT 'Initial' AS Stage, CAST(N'EmployeeBranch initial failed: could not acquire applock.' AS nvarchar(4000)) AS Summary;
         RETURN -1;
-    END
+    END;
     SET @lockHeld = 1;
 
     BEGIN TRY
@@ -36,6 +36,15 @@ BEGIN
             RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.DISTKEY'))
             RAISERROR('Change Tracking is not enabled on dbo.DISTKEY.', 16, 1);
+
+        -- We reference tbl_Branch below; ensure it exists with required columns
+        IF NOT (OBJECT_ID('dbo.tbl_Branch','U') IS NOT NULL
+                AND COL_LENGTH('dbo.tbl_Branch','UUID')            IS NOT NULL
+                AND COL_LENGTH('dbo.tbl_Branch','Old_Branch_UUID') IS NOT NULL
+                AND COL_LENGTH('dbo.tbl_Branch','Branch_Name')     IS NOT NULL)
+        BEGIN
+            RAISERROR('dbo.tbl_Branch is missing or lacks required columns (UUID, Old_Branch_UUID, Branch_Name). Run Branch initial first.', 16, 1);
+        END
 
         /* 2) Fence CT window */
         SET @BaselineFrom = CHANGE_TRACKING_CURRENT_VERSION();
@@ -53,11 +62,12 @@ BEGIN
 
         MERGE dbo.CT_Watermark AS t
         USING (SELECT @Process AS ProcessName) s
-           ON t.ProcessName = s.ProcessName
+          ON t.ProcessName = s.ProcessName
         WHEN MATCHED THEN
             UPDATE SET LastSyncVersion=@BaselineFrom, LastSyncTime=SYSUTCDATETIME()
         WHEN NOT MATCHED THEN
-            INSERT(ProcessName, LastSyncVersion, LastSyncTime) VALUES(@Process, @BaselineFrom, SYSUTCDATETIME());
+            INSERT(ProcessName, LastSyncVersion, LastSyncTime)
+            VALUES(@Process, @BaselineFrom, SYSUTCDATETIME());
 
         /* 4) Recreate target */
         IF OBJECT_ID('dbo.tbl_EmployeeBranch','U') IS NOT NULL
@@ -66,21 +76,28 @@ BEGIN
         CREATE TABLE dbo.tbl_EmployeeBranch
         (
             Employee_UUID   INT           NOT NULL,
-            Branch_UUID     VARCHAR(55)   NULL,            -- references dbo.tbl_Branch.UUID
+            Branch_UUID     VARCHAR(55)   NULL,    -- FK to dbo.tbl_Branch.UUID
             Start_Date      DATETIME      NULL,
             End_Date        DATETIME      NULL,
             [Status]        NVARCHAR(255) NULL,
             [Group]         NVARCHAR(255) NULL,
             Left_Reason     NVARCHAR(255) NULL,
             [Location]      NVARCHAR(255) NULL,
-            Main_Branch     CHAR(1)       NULL,            -- 'Y'/'N'
+            Main_Branch     CHAR(1)       NULL,    -- 'Y'/'N'
             Branch_Name     NVARCHAR(255) NULL,
 
-            -- deterministic persisted computed PK from Employee_UUID + Branch_UUID
-            UUID AS CONVERT(varbinary(32), HASHBYTES(
-                      'SHA2_256',
-                      CONCAT(CONVERT(nvarchar(20), Employee_UUID), N'|', COALESCE(UPPER(LTRIM(RTRIM(Branch_UUID))), N'<NULL>'))
-                  )) PERSISTED,
+            -- Persisted, explicitly-typed varchar(64) computed PK (SHA2_256 hex)
+            UUID AS CONVERT(varchar(64),
+                    LOWER(CONVERT(varchar(64),
+                        HASHBYTES('SHA2_256',
+                            CONCAT(
+                                CONVERT(nvarchar(20), Employee_UUID),
+                                N'|',
+                                COALESCE(UPPER(LTRIM(RTRIM(Branch_UUID))), N'<NULL>')
+                            )
+                        ), 2
+                    ))
+                  ) PERSISTED,
 
             CreatedAtUTC    datetime2(3)  NOT NULL CONSTRAINT DF_tbl_EmployeeBranch_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
             UpdatedAtUTC    datetime2(3)  NOT NULL CONSTRAINT DF_tbl_EmployeeBranch_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
@@ -88,54 +105,86 @@ BEGIN
             CONSTRAINT PK_tbl_EmployeeBranch PRIMARY KEY NONCLUSTERED (UUID)
         );
 
-        /* 5) OPTIONAL visit aggregation (avoid compile errors using dynamic SQL) */
+        /* 5) Optional visit aggregation (robust, column-name aware) */
         IF OBJECT_ID('tempdb..#VisitAgg') IS NOT NULL DROP TABLE #VisitAgg;
         CREATE TABLE #VisitAgg
         (
-            Employee_UUID        INT          NOT NULL,
-            Old_Branch_UUID      VARCHAR(55)  NOT NULL,
-            FirstVisitStartDate  DATETIME     NULL,
-            LastVisitEndDate     DATETIME     NULL,
+            Employee_UUID        INT         NOT NULL,
+            Old_Branch_UUID      VARCHAR(20) NOT NULL,
+            FirstVisitStartDate  DATETIME    NULL,
+            LastVisitEndDate     DATETIME    NULL,
             PRIMARY KEY (Employee_UUID, Old_Branch_UUID)
         );
 
-        DECLARE @haveVisits bit = 0;
-
+        DECLARE @hasVisits bit = 0;
         IF OBJECT_ID('dbo.tbl_Visits','U') IS NOT NULL
-           AND COL_LENGTH('dbo.tbl_Visits','Employee_UUID')  IS NOT NULL
-           AND COL_LENGTH('dbo.tbl_Visits','Branch_UUID')    IS NOT NULL
-           AND COL_LENGTH('dbo.tbl_Visits','VisitStartDate') IS NOT NULL
-           AND COL_LENGTH('dbo.tbl_Visits','VisitEndDate')   IS NOT NULL
-           AND OBJECT_ID('dbo.tbl_Branch','U') IS NOT NULL
-           AND COL_LENGTH('dbo.tbl_Branch','UUID')           IS NOT NULL
-           AND COL_LENGTH('dbo.tbl_Branch','Old_Branch_UUID') IS NOT NULL
+           AND COL_LENGTH('dbo.tbl_Visits','Employee_UUID')   IS NOT NULL
+           AND COL_LENGTH('dbo.tbl_Visits','Branch_UUID')     IS NOT NULL
         BEGIN
-            SET @haveVisits = 1;
+            SET @hasVisits = 1;
         END
 
-        IF @haveVisits = 1
+        IF @hasVisits = 1
         BEGIN
-            DECLARE @sql nvarchar(max) = N'
-                INSERT INTO #VisitAgg (Employee_UUID, Old_Branch_UUID, FirstVisitStartDate, LastVisitEndDate)
-                SELECT
-                    v.Employee_UUID,
-                    b.Old_Branch_UUID,
-                    MIN(v.VisitStartDate),
-                    MAX(v.VisitEndDate)
-                FROM dbo.tbl_Visits AS v
-                JOIN dbo.tbl_Branch AS b
-                  ON v.Branch_UUID = b.UUID
-                GROUP BY v.Employee_UUID, b.Old_Branch_UUID;';
-            EXEC sp_executesql @sql;
+            DECLARE @StartCol sysname, @EndCol sysname;
+
+            DECLARE @cols TABLE (name sysname NOT NULL);
+            INSERT INTO @cols(name)
+            SELECT c.name
+            FROM sys.columns c
+            WHERE c.object_id = OBJECT_ID(N'dbo.tbl_Visits');
+
+            SELECT TOP (1) @StartCol = name
+            FROM @cols
+            WHERE name IN (N'VisitStartDate', N'Visit_Start_Date', N'StartDate', N'Start_Date', N'VisitStart', N'VisitStartTime', N'StartDateTime')
+            ORDER BY CASE name
+                       WHEN N'VisitStartDate'   THEN 1
+                       WHEN N'Visit_Start_Date' THEN 2
+                       WHEN N'StartDate'        THEN 3
+                       WHEN N'Start_Date'       THEN 4
+                       WHEN N'VisitStart'       THEN 5
+                       WHEN N'VisitStartTime'   THEN 6
+                       WHEN N'StartDateTime'    THEN 7
+                       ELSE 99 END;
+
+            SELECT TOP (1) @EndCol = name
+            FROM @cols
+            WHERE name IN (N'VisitEndDate', N'Visit_End_Date', N'EndDate', N'End_Date', N'VisitEnd', N'VisitEndTime', N'EndDateTime')
+            ORDER BY CASE name
+                       WHEN N'VisitEndDate'     THEN 1
+                       WHEN N'Visit_End_Date'   THEN 2
+                       WHEN N'EndDate'          THEN 3
+                       WHEN N'End_Date'         THEN 4
+                       WHEN N'VisitEnd'         THEN 5
+                       WHEN N'VisitEndTime'     THEN 6
+                       WHEN N'EndDateTime'      THEN 7
+                       ELSE 99 END;
+
+            IF @StartCol IS NOT NULL AND @EndCol IS NOT NULL
+            BEGIN
+                DECLARE @vsql nvarchar(max) =
+                    N'INSERT INTO #VisitAgg (Employee_UUID, Old_Branch_UUID, FirstVisitStartDate, LastVisitEndDate)
+                      SELECT
+                          v.Employee_UUID,
+                          b.Old_Branch_UUID,
+                          MIN(v.' + QUOTENAME(@StartCol) + N'),
+                          MAX(v.' + QUOTENAME(@EndCol)   + N')
+                      FROM dbo.tbl_Visits AS v
+                      JOIN dbo.tbl_Branch AS b
+                        ON v.Branch_UUID = b.UUID
+                      GROUP BY v.Employee_UUID, b.Old_Branch_UUID;';
+                EXEC sys.sp_executesql @vsql;
+            END
+            -- else: skip aggregation silently if start/end not found
         END
-        -- else: leave #VisitAgg empty; downstream LEFT JOIN is safe
+        -- else: leave #VisitAgg empty; downstream LEFT JOINs are safe
 
         /* 6) Populate baseline */
         ;WITH cte_distinct_emp_branch AS
         (
             SELECT DISTINCT
-                DK.INPRIKEY    AS Employee_UUID,         -- EMPLOYEE.EMP_REF
-                DK.OUTPRIKEY   AS Old_Branch_UUID,       -- maps to tbl_Branch.Old_Branch_UUID
+                DK.INPRIKEY    AS Employee_UUID,     -- EMPLOYEE.EMP_REF
+                DK.OUTPRIKEY   AS Old_Branch_UUID,   -- maps to tbl_Branch.Old_Branch_UUID
                 DK.START_DATE  AS DK_Start_Date,
                 DK.[DATE]      AS DK_End_Date,
                 DK.LEFTREASON,
@@ -156,7 +205,7 @@ BEGIN
                 d.StatusCode,
                 d.CARE_GRP_REF,
 
-                e.GS_REF,                                       -- employee’s home/legacy branch
+                e.GS_REF,                                 -- employee’s legacy home branch
                 el.DESCRIPTION   AS EmpLocationDesc,
                 es.DESCRIPTION   AS StatusDesc,
                 ecg.DESCRIPTION  AS CareGroupDesc,
@@ -179,6 +228,8 @@ BEGIN
         (
             SELECT
                 b.Employee_UUID,
+
+                -- Map Old_Branch_UUID + location rule to a specific tbl_Branch.UUID
                 Branch_UUID = CAST(pick.Branch_UUID AS varchar(55)),
                 Branch_Name = pick.Branch_Name,
 
@@ -199,16 +250,15 @@ BEGIN
                         ELSE b.DK_End_Date
                     END,
 
-                [Status]     = CASE WHEN b.StatusDesc      = '<No Selection>' THEN '' ELSE b.StatusDesc      END,
-                [Group]      = CASE WHEN b.CareGroupDesc   = '<No Selection>' THEN '' ELSE b.CareGroupDesc   END,
-                Left_Reason  = CASE WHEN b.LeftReasonDesc  = '<No Selection>' THEN '' ELSE b.LeftReasonDesc  END,
-                [Location]   = CASE WHEN b.EmpBranchLocDesc= '<No Selection>' THEN '' ELSE b.EmpBranchLocDesc END,
-                Main_Branch  = CASE WHEN b.Old_Branch_UUID = b.GS_REF THEN 'Y' ELSE 'N' END
+                [Status]     = CASE WHEN b.StatusDesc       = '<No Selection>' THEN N'' ELSE b.StatusDesc       END,
+                [Group]      = CASE WHEN b.CareGroupDesc    = '<No Selection>' THEN N'' ELSE b.CareGroupDesc    END,
+                Left_Reason  = CASE WHEN b.LeftReasonDesc   = '<No Selection>' THEN N'' ELSE b.LeftReasonDesc   END,
+                [Location]   = CASE WHEN b.EmpBranchLocDesc = '<No Selection>' THEN N'' ELSE b.EmpBranchLocDesc END,
 
+                Main_Branch  = CASE WHEN b.Old_Branch_UUID = b.GS_REF THEN 'Y' ELSE 'N' END
             FROM Base b
             OUTER APPLY
             (
-                -- Map Old_Branch_UUID + location rule to a specific tbl_Branch.UUID
                 SELECT TOP (1)
                        tb.UUID        AS Branch_UUID,
                        tb.Branch_Name AS Branch_Name
@@ -228,12 +278,12 @@ BEGIN
                 MIN(s.EffectiveStartDate) AS Start_Date,
                 CASE WHEN SUM(CASE WHEN s.EffectiveEndDate IS NULL THEN 1 ELSE 0 END) > 0
                      THEN NULL ELSE MAX(s.EffectiveEndDate) END AS End_Date,
-                MAX(s.[Status])       AS [Status],
-                MAX(s.[Group])        AS [Group],
-                MAX(s.Left_Reason)    AS Left_Reason,
-                MAX(s.[Location])     AS [Location],
-                MAX(s.Main_Branch)    AS Main_Branch,
-                MAX(s.Branch_Name)    AS Branch_Name
+                MAX(s.[Status])    AS [Status],
+                MAX(NULLIF(s.[Group],       N'')) AS [Group],
+                MAX(NULLIF(s.Left_Reason,   N'')) AS Left_Reason,
+                MAX(NULLIF(s.[Location],    N'')) AS [Location],
+                MAX(s.Main_Branch) AS Main_Branch,     -- 'Y' beats 'N'
+                MAX(s.Branch_Name) AS Branch_Name
             FROM Shaped s
             WHERE s.Branch_UUID IS NOT NULL
               AND s.EffectiveStartDate IS NOT NULL
@@ -248,7 +298,7 @@ BEGIN
         )
         SELECT
             f.Employee_UUID, f.Branch_UUID, f.Start_Date, f.End_Date,
-            f.[Status], NULLIF(f.[Group], ''), NULLIF(f.Left_Reason, ''), NULLIF(f.[Location], ''),
+            f.[Status], f.[Group], f.Left_Reason, f.[Location],
             f.Main_Branch, f.Branch_Name,
             @RunStartedAt, @RunStartedAt
         FROM FinalAgg f;
@@ -270,7 +320,7 @@ BEGIN
                 ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
         END
 
-        /* 9) Summary + robust incremental kick */
+        /* 9) Summary + optional incremental kick */
         DECLARE @EndInitialUTC datetime2(3) = SYSUTCDATETIME();
         DECLARE @EndInitialIso varchar(33)  = CONVERT(varchar(33), @EndInitialUTC, 126);
 
@@ -285,7 +335,6 @@ BEGIN
         IF OBJECT_ID(N'dbo.usp_Sync_EmployeeBranch_Incremental', N'P') IS NOT NULL
         BEGIN
             BEGIN TRY
-                -- Try NEW signature
                 SET @IncrMsg = N'';
                 EXEC @rc = dbo.usp_Sync_EmployeeBranch_Incremental
                     @ChunkSize        = 100000,
@@ -294,30 +343,14 @@ BEGIN
                     @EmitInfo         = 0,
                     @Summary          = @IncrMsg OUTPUT,
                     @ReturnSummaryRow = 0;
-
-                IF @IncrMsg = N''
-                    SET @IncrMsg = CONCAT(N'EmployeeBranch incremental ran (rc=', @rc, N').');
+                IF @IncrMsg = N'' SET @IncrMsg = CONCAT(N'EmployeeBranch incremental ran (rc=', @rc, N').');
             END TRY
             BEGIN CATCH
-                -- Fallback to OLD signature
-                SET @IncrMsg = N'EmployeeBranch incremental ran (legacy signature).';
-                BEGIN TRY
-                    SET @rc = 0;
-                    EXEC @rc = dbo.usp_Sync_EmployeeBranch_Incremental
-                        @ChunkSize     = 100000,
-                        @LockTimeoutMs = 600000,
-                        @UseAppLock    = 0,
-                        @EmitInfo      = 0;
-                    SET @IncrMsg = CONCAT(@IncrMsg, N' (rc=', @rc, N').');
-                END TRY
-                BEGIN CATCH
-                    DECLARE @em nvarchar(4000)=ERROR_MESSAGE();
-                    SET @IncrMsg = CONCAT(N'EmployeeBranch incremental failed to run: ', @em);
-                END CATCH
+                DECLARE @em nvarchar(4000)=ERROR_MESSAGE();
+                SET @IncrMsg = CONCAT(N'EmployeeBranch incremental failed to run: ', @em);
             END CATCH
         END
 
-        -- Return exactly TWO rows
         SELECT 'Initial' AS Stage,     @InitialMsg AS Summary
         UNION ALL
         SELECT 'Incremental',          @IncrMsg;

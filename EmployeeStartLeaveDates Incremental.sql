@@ -114,20 +114,29 @@ BEGIN
         BEGIN
             CREATE TABLE dbo.tbl_EmployeeBranch_KeyMap
             (
-              UUID           varbinary(32) NOT NULL PRIMARY KEY,  -- matches tbl_EmployeeBranch.UUID
+              -- KEEPING EXISTING SCHEMA: binary UUID
+              UUID           varbinary(32) NOT NULL PRIMARY KEY,  -- matches KeyMap design
               Employee_UUID  varchar(50)   NOT NULL,
               Branch_UUID    varchar(55)   NULL,
               UpdatedAtUTC   datetime2(3)  NOT NULL DEFAULT SYSUTCDATETIME()
             );
 
+            -- EXPLICIT CONVERT from source varchar UUID -> varbinary(32)
             INSERT INTO dbo.tbl_EmployeeBranch_KeyMap (UUID, Employee_UUID, Branch_UUID)
-            SELECT UUID, Employee_UUID, Branch_UUID
-            FROM dbo.tbl_EmployeeBranch;
+            SELECT CONVERT(varbinary(32), eb.UUID), eb.Employee_UUID, eb.Branch_UUID
+            FROM dbo.tbl_EmployeeBranch AS eb;
         END
         ELSE
         BEGIN
+            -- Keep the join key types aligned with explicit CONVERT on the source side
             MERGE dbo.tbl_EmployeeBranch_KeyMap AS m
-            USING (SELECT UUID, Employee_UUID, Branch_UUID FROM dbo.tbl_EmployeeBranch) s
+            USING (
+                SELECT
+                    CONVERT(varbinary(32), eb.UUID) AS UUID,
+                    eb.Employee_UUID,
+                    eb.Branch_UUID
+                FROM dbo.tbl_EmployeeBranch AS eb
+            ) AS s
               ON m.UUID = s.UUID
             WHEN MATCHED AND (m.Employee_UUID <> s.Employee_UUID OR ISNULL(m.Branch_UUID,'') <> ISNULL(s.Branch_UUID,'')) THEN
               UPDATE SET m.Employee_UUID = s.Employee_UUID,
@@ -150,11 +159,12 @@ BEGIN
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
           AND ct.SYS_CHANGE_OPERATION IN ('I','U');
 
-        -- Deletes: resolve Employee_UUID via key-map
+        -- Deletes: resolve Employee_UUID via key-map (explicit CONVERT on ct.UUID)
         INSERT INTO #Changed(Employee_UUID)
         SELECT DISTINCT km.Employee_UUID
         FROM CHANGETABLE(CHANGES dbo.tbl_EmployeeBranch, @LastSyncVersion) ct
-        JOIN dbo.tbl_EmployeeBranch_KeyMap km ON km.UUID = ct.UUID
+        JOIN dbo.tbl_EmployeeBranch_KeyMap km
+             ON km.UUID = CONVERT(varbinary(32), ct.UUID)
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
           AND ct.SYS_CHANGE_OPERATION = 'D'
           AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.Employee_UUID = km.Employee_UUID);

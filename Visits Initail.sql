@@ -114,7 +114,7 @@ BEGIN
         SELECT AHD.ACT_REF
         FROM dbo.ACTIVITY_HD AHD
         WHERE AHD.[TYPE] <> 1
-          AND AHD.START_DTM >= DATEADD(MONTH, -6, SYSUTCDATETIME());  -- only last 6 months;
+          AND AHD.START_DTM >= DATEADD(YEAR, -3, SYSUTCDATETIME());  -- only last 3 years;
 
         DECLARE @Total int = (SELECT COUNT(*) FROM #Keys);
         DECLARE @EstBatches int = CASE WHEN @Total = 0 THEN 0 ELSE (@Total + @ChunkSize - 1) / @ChunkSize END;
@@ -179,7 +179,7 @@ BEGIN
                 LEFT JOIN dbo.SERVICE_HD   AS SHD ON AHD.SERVICE_REF  = SHD.SERVICE_REF
                 LEFT JOIN dbo.CAREPLAN_DT  AS CPDT ON AHD.CPLAN_DET_REF = CPDT.CPLAN_DET_REF
                 WHERE AHD.[TYPE] <> 1
-                AND AHD.START_DTM >= DATEADD(MONTH, -6, SYSUTCDATETIME()) 
+                AND AHD.START_DTM >= DATEADD(YEAR, -3, SYSUTCDATETIME())  -- only last 3 years
             )
             INSERT INTO dbo.tbl_Visits (
                 UUID, Client_UUID, Employee_UUID, Planned_Employee_UUID, Careplan_UUID,
