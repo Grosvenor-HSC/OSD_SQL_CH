@@ -1,80 +1,24 @@
-# OSD_SQL_CH
+# NewCHSQL
 
-SQL scripts and utilities for CH OSD (Operational Support Data) management.
+This repository contains SQL Server scripts used to load, transform, enrich, and build reporting outputs
+for CH/OSD reporting.
 
-## Table of Contents
+## Folder layout
+- `sql/10_extract/`   External pulls (e.g. Linked Server / OPENQUERY)
+- `sql/20_stage/`     Entity loads (initial + incremental)
+- `sql/30_core/`      Derived/enrichment tables (e.g. visit distance)
+- `sql/40_reporting/` Reporting builds (tables/views used by BI)
+- `orchestration/`    Run order scripts (SQL Agent / manual execution)
+- `tests/`            Sanity checks
 
-- [Overview](#overview)
-- [Features](#features)
-- [Getting Started](#getting-started)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Project Structure](#project-structure)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
+## How to run
+### One-time initial build
+Run: `orchestration/sql_agent/run_initial.sql`
 
-## Overview
+### Daily refresh
+Run: `orchestration/sql_agent/run_daily.sql`
 
-This repository contains SQL scripts and related resources for managing and querying the CH OSD database. It is intended to support data operations, reporting, and maintenance tasks.
-
-## Features
-
-- Modular SQL scripts for common OSD operations
-- Data import/export utilities
-- Example queries and stored procedures
-- Schema documentation
-
-## Getting Started
-
-Clone the repository and review the scripts to fit your environment.
-
-```sh
-git clone https://github.com/your-org/OSD_SQL_CH.git
-cd OSD_SQL_CH
-```
-
-## Prerequisites
-
-- SQL Server (or compatible database)
-- Access credentials to the CH OSD database
-- SQL client (e.g., SSMS, Azure Data Studio)
-
-## Installation
-
-No installation is required. Scripts can be executed directly using your preferred SQL client.
-
-## Usage
-
-1. Review the scripts in the `scripts/` directory.
-2. Update connection strings or parameters as needed.
-3. Execute scripts in your SQL environment.
-
-**Example:**
-
-```sql
--- Run a sample query
-SELECT * FROM OSD_Records WHERE Status = 'Active';
-```
-
-## Project Structure
-
-```
-/scripts         # Core SQL scripts
-/docs            # Documentation and schema diagrams
-/examples        # Example queries and usage
-README.md        # Project documentation
-```
-
-## Contributing
-
-Contributions are welcome! Please open issues or submit pull requests for improvements.
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-## Contact
-
-For questions or support, contact the project maintainer at [your.email@example.com](mailto:your.email@example.com).
+## Important safety notes
+- “Initial” scripts are one-time backfills. Do not run casually on production.
+- Incrementals should not be run in parallel unless you are certain they are isolated.
+- Reporting builds should run only after upstream loads complete.

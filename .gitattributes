@@ -1,2 +1,11 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Enforce LF line endings for text files
+* text=auto eol=lf
+
+# SQL scripts
+*.sql text eol=lf
+
+# Markdown
+*.md text eol=lf
+
+# PowerShell
+*.ps1 text eol=lf
