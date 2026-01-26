@@ -1,4 +1,11 @@
-CREATE OR ALTER PROCEDURE [dbo].[usp_Sync_Clients_Incremental]
+USE [DOM_LIVE]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_Sync_Clients_Incremental]    Script Date: 26/01/2026 20:44:38 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER   PROCEDURE [dbo].[usp_Sync_Clients_Incremental]
     @ChunkSize         int  = 100000,
     @LockTimeoutMs     int  = 60000,
     @UseAppLock        bit  = 1,
@@ -414,4 +421,3 @@ BEGIN
         RETURN -50001;
     END CATCH
 END
-GO

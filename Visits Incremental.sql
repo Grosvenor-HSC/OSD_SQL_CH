@@ -1,4 +1,11 @@
-CREATE OR ALTER PROCEDURE dbo.usp_Sync_Visits_Incremental
+USE [DOM_LIVE]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_Sync_Visits_Incremental]    Script Date: 26/01/2026 20:50:28 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER   PROCEDURE [dbo].[usp_Sync_Visits_Incremental]
     @ChunkSize        int            = 100000,
     @LockTimeoutMs    int            = 60000,
     @UseAppLock       bit            = 1,
@@ -151,7 +158,7 @@ BEGIN
                     CASE WHEN CPDT.EMP_REF = 0 THEN NULL ELSE CAST(CPDT.EMP_REF AS varchar(50)) END AS Planned_Employee_UUID,
                     CASE WHEN AHD.CPLAN_DET_REF = 0 THEN NULL ELSE AHD.CPLAN_DET_REF END          AS Careplan_UUID,
                     CASE WHEN AHD.GS_REF = 0 THEN NULL ELSE AHD.GS_REF END                       AS Group_UUID,         
-                    CAST(AHD.GS_REF AS varchar(50))       AS Branch_UUID,
+                    CAST(C.[Branch_UUID] AS varchar(50))       AS Branch_UUID,
                     CAST(CHD.CONTRACT_REF AS varchar(50)) AS Contract_UUID,
                     CASE WHEN AHD.MLINKREF = 0 THEN NULL ELSE AHD.MLINKREF END                     AS Linked_Visit_UUID,
                     CAST(COALESCE(CPDT.QUANTITY,0) * 60 AS INT)                                    AS Planned_Duration,
@@ -176,6 +183,7 @@ BEGIN
                 LEFT JOIN dbo.CONTRACT_HD  AS CHD ON CDT.CONTRACT_REF = CHD.CONTRACT_REF
                 LEFT JOIN dbo.SERVICE_HD   AS SHD ON AHD.SERVICE_REF  = SHD.SERVICE_REF
                 LEFT JOIN dbo.CAREPLAN_DT  AS CPDT ON AHD.CPLAN_DET_REF = CPDT.CPLAN_DET_REF
+                join tbl_Clients c on ahd.CLIENT_REF = C.UUID
                 WHERE AHD.[TYPE] <> 1
                 AND AHD.START_DTM >= DATEADD(year, -3, SYSUTCDATETIME()) 
             )
@@ -277,4 +285,3 @@ BEGIN
         RETURN -50001;
     END CATCH
 END
-GO

@@ -1,11 +1,12 @@
-USE [DOM_LIVE];
+USE [DOM_LIVE]
 GO
-SET ANSI_NULLS ON;
+/****** Object:  StoredProcedure [dbo].[usp_Sync_Employees_Incremental]    Script Date: 26/01/2026 20:45:52 ******/
+SET ANSI_NULLS ON
 GO
-SET QUOTED_IDENTIFIER ON;
+SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE OR ALTER PROCEDURE dbo.usp_Sync_Employees_Incremental
+ALTER   PROCEDURE [dbo].[usp_Sync_Employees_Incremental]
     @ChunkSize        int  = 100000,
     @LockTimeoutMs    int  = 60000,
     @UseAppLock       bit  = 1,
@@ -364,4 +365,3 @@ FinallyRelease:
         RETURN -50001;
     END CATCH
 END
-GO

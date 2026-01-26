@@ -1,11 +1,12 @@
 USE [DOM_LIVE]
 GO
+/****** Object:  StoredProcedure [dbo].[usp_Sync_ClientDiary_Initial]    Script Date: 26/01/2026 20:44:12 ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE OR ALTER PROCEDURE dbo.usp_Sync_ClientDiary_Initial
+ALTER   PROCEDURE [dbo].[usp_Sync_ClientDiary_Initial]
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -84,7 +85,7 @@ SELECT
     CAST(CDY.CLIENT_REF AS varchar(20))   AS Client_UUID,
     CAST(CDY.CL_DY_REF  AS varchar(20))   AS UUID,
     CDY.ENTRY_DATE                         AS Client_Diary_Entry_Date,
-    ltrim(rtrim(CET.DESCRIPTION))         AS Client_Diary_Entry_Type,
+    CET.DESCRIPTION                        AS Client_Diary_Entry_Type,
     CDY.ENTRY_TEXT                         AS Client_Diary_Entry_Text,
     @RunStartedAt                          AS CreatedAtUTC,
     @RunStartedAt                          AS UpdatedAtUTC
@@ -145,4 +146,3 @@ WHERE C.RECTYPE NOT IN (''S'',''R'');';
         RETURN -50001;
     END CATCH
 END
-GO

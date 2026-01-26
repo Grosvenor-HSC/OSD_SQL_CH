@@ -1,4 +1,11 @@
-CREATE OR ALTER PROCEDURE dbo.usp_Sync_EmployeeSkills_Initial
+USE [DOM_LIVE]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeeSkills_Initial]    Script Date: 26/01/2026 20:49:34 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER   PROCEDURE [dbo].[usp_Sync_EmployeeSkills_Initial]
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -163,4 +170,3 @@ BEGIN
         RETURN -50001;
     END CATCH
 END
-GO
