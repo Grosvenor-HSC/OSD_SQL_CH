@@ -108,7 +108,7 @@ BEGIN
             Telephone_1           VARCHAR(50)  NULL,
             Telephone_2           VARCHAR(50)  NULL,
             Title                 VARCHAR(50)  NULL,
-            [Group]               VARCHAR(50)  NULL,
+            Care_Group            VARCHAR(50)  NULL,
             CH_Code               VARCHAR(50)  NULL,
             Gender                VARCHAR(20)  NULL,
             StartDate             DATE         NULL,
@@ -151,7 +151,7 @@ BEGIN
                 Telephone_1          = ca.TEL_NO1,
                 Telephone_2          = ca.TEL_NO2,
                 Title                = ca.TITLE,
-                [Group]              = ca.CARE_GRP,
+                Care_Group            = ca.CARE_GRP,
                 CH_Code              = ca.CLIENT_CODE,
                 Gender               = CASE WHEN C.SEX='M' THEN 'Male'
                                             WHEN C.SEX='F' THEN 'Female'
@@ -240,7 +240,7 @@ BEGIN
             Branch_UUID, UUID, Case_No, DOB,
             First_Line_Address, Second_Line_Address, Third_Line_Address, Fourth_Line_Address,
             Postcode, Forenames, Surname, Email, Telephone_1, Telephone_2,
-            Title, [Group], CH_Code, Gender, StartDate, LeaveDate, Status,
+            Title, Care_Group, CH_Code, Gender, StartDate, LeaveDate, Status,
             Disability_1, Disability_2, Disability_3, Ethnicity,
             LeftReason, Religion, Location, Type,
             CreatedAtUTC, UpdatedAtUTC
@@ -249,7 +249,7 @@ BEGIN
             Branch_UUID, UUID, Case_No, DOB,
             First_Line_Address, Second_Line_Address, Third_Line_Address, Fourth_Line_Address,
             Postcode, Forenames, Surname, Email, Telephone_1, Telephone_2,
-            Title, [Group], CH_Code, Gender, StartDate, LeaveDate, Status,
+            Title, Care_Group, CH_Code, Gender, StartDate, LeaveDate, Status,
             Disability_1, Disability_2, Disability_3, Ethnicity,
             LeftReason, Religion, Location, Type,
             @RunStartedAt, @RunStartedAt

@@ -261,7 +261,7 @@ BEGIN
                     Telephone_2 = NULLIF(LTRIM(RTRIM(CHD.TEL_NO2)), ''),
 
                     Title       = NULLIF(LTRIM(RTRIM(CTL.DESCRIPTION)), ''),
-                    [Group]     = NULLIF(LTRIM(RTRIM(CG.DESCRIPTION)), ''),
+                    Care_Group  = NULLIF(LTRIM(RTRIM(CG.DESCRIPTION)), ''),
                     CH_Code     = NULLIF(LTRIM(RTRIM(C.CLIENT_CODE)), ''),
 
                     Gender      = CASE WHEN C.SEX='M' THEN 'Male'
@@ -339,7 +339,7 @@ BEGIN
                     tgt.Telephone_1           = src.Telephone_1,
                     tgt.Telephone_2           = src.Telephone_2,
                     tgt.Title                 = src.Title,
-                    tgt.[Group]               = src.[Group],
+                    tgt.Care_Group            = src.Care_Group,
                     tgt.CH_Code               = src.CH_Code,
                     tgt.Gender                = src.Gender,
                     tgt.StartDate             = src.StartDate,
@@ -360,7 +360,7 @@ BEGIN
                     Branch_UUID, UUID, Case_No, DOB,
                     First_Line_Address, Second_Line_Address, Third_Line_Address, Fourth_Line_Address,
                     Postcode, Forenames, Surname, Email, Telephone_1, Telephone_2,
-                    Title, [Group], CH_Code, Gender, StartDate, LeaveDate, Status,
+                    Title, Care_Group, CH_Code, Gender, StartDate, LeaveDate, Status,
                     Disability_1, Disability_2, Disability_3, Ethnicity,
                     LeftReason, Religion, Location, Type,
                     External_Reference, CreatedAtUTC, UpdatedAtUTC
@@ -369,7 +369,7 @@ BEGIN
                     src.Branch_UUID, src.UUID, src.Case_No, src.DOB,
                     src.First_Line_Address, src.Second_Line_Address, src.Third_Line_Address, src.Fourth_Line_Address,
                     src.Postcode, src.Forenames, src.Surname, src.Email, src.Telephone_1, src.Telephone_2,
-                    src.Title, src.[Group], src.CH_Code, src.Gender, src.StartDate, src.LeaveDate, src.Status,
+                    src.Title, src.Care_Group, src.CH_Code, src.Gender, src.StartDate, src.LeaveDate, src.Status,
                     src.Disability_1, src.Disability_2, src.Disability_3, src.Ethnicity,
                     src.LeftReason, src.Religion, src.Location, src.Type,
                     src.External_Reference, @RunStartedAt, @RunStartedAt
