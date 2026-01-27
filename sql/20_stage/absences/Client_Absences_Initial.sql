@@ -25,15 +25,21 @@ Notes:
     - Used by compliance, utilisation, and reporting logic.
 */
 
-USE [DOM_LIVE]
-GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_ClientAbsences_Initial]    Script Date: 26/01/2026 20:43:27 ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+/* ============================================================
+   File: Client_Absences_Initial.sql
+   Refactor: UUID + Client_UUID changed from NVARCHAR to INT
+   Source facts: INACTIVE_DY.INACT_REF is INT; INACTIVE_DY.CLIENT_REF is INT
+   ============================================================ */
+
+USE [DOM_LIVE];
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_ClientAbsences_Initial]
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [dbo].[usp_Sync_ClientAbsences_Initial]
     @Summary nvarchar(4000) = NULL OUTPUT
 AS
 BEGIN
@@ -49,22 +55,25 @@ BEGIN
     DECLARE @lockResult    int;
     DECLARE @lockHeld      bit = 0;
 
-    -- Concurrency (wide window for baseline)
+    /* Concurrency (wide window for baseline) */
     EXEC @lockResult = sys.sp_getapplock
         @Resource=@LockResource, @LockMode='Exclusive',
         @LockOwner='Session', @DbPrincipal='dbo', @LockTimeout=600000;
+
     IF @lockResult NOT IN (0,1)
     BEGIN
         SET @Summary = N'ClientAbsences initial failed: could not acquire applock.';
         SELECT 'Initial' AS Stage, @Summary AS Summary;
         RETURN -1;
     END;
+
     SET @lockHeld = 1;
 
     BEGIN TRY
         /* 1) Preconditions */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
             RAISERROR('Change Tracking is not enabled at DB level.', 16, 1);
+
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.INACTIVE_DY'))
             RAISERROR('Change Tracking is not enabled on dbo.INACTIVE_DY.', 16, 1);
 
@@ -97,9 +106,9 @@ BEGIN
 
         CREATE TABLE dbo.tbl_ClientAbsences
         (
-            UUID                 nvarchar(55)  NOT NULL,
-            Client_UUID          nvarchar(55)  NULL,
-            Absence_Reason       nvarchar(255) NULL,
+            UUID                 INT           NOT NULL,  -- INACT_REF
+            Client_UUID          INT           NULL,      -- CLIENT_REF
+            Absence_Reason       NVARCHAR(255) NULL,
             Absence_Start_Date   date          NULL,
             Absence_End_Date     date          NULL,
             CreatedAtUTC         datetime2(3)  NOT NULL DEFAULT SYSUTCDATETIME(),
@@ -114,12 +123,11 @@ BEGIN
             Absence_Start_Date, Absence_End_Date,
             CreatedAtUTC, UpdatedAtUTC
         )
-        SELECT 
-            CAST(IDY.INACT_REF  AS nvarchar(55)) AS UUID,
-            CAST(IDY.CLIENT_REF AS nvarchar(55)) AS Client_UUID,
-            NULLIF(LTRIM(RTRIM(CR.DESCRIPTION)), '') AS Absence_Reason,
-            CAST(IDY.START_DT AS date)              AS Absence_Start_Date,
-            -- If END_DT can be blank text in source, use TRY_CONVERT; otherwise just CAST
+        SELECT
+            IDY.INACT_REF                                 AS UUID,
+            IDY.CLIENT_REF                                AS Client_UUID,
+            NULLIF(LTRIM(RTRIM(CR.DESCRIPTION)), N'')      AS Absence_Reason,
+            CAST(IDY.START_DT AS date)                    AS Absence_Start_Date,
             TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(CONVERT(varchar(30), IDY.END_DT, 126))), '')) AS Absence_End_Date,
             @RunStartedAt AS CreatedAtUTC,
             @RunStartedAt AS UpdatedAtUTC
@@ -158,6 +166,7 @@ BEGIN
             EXEC @rc = dbo.usp_Sync_ClientAbsences_Incremental
                 @ChunkSize=50000, @LockTimeoutMs=600000, @UseAppLock=0,
                 @EmitInfo=0, @Summary=@IncrMsg OUTPUT;
+
             IF (@rc < 0)
                 SET @IncrMsg = CONCAT(@IncrMsg, N' (rc=', @rc, N')');
         END;
@@ -176,9 +185,11 @@ BEGIN
     BEGIN CATCH
         IF @lockHeld=1
             EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner='Session', @DbPrincipal='dbo';
+
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         SET @Summary = CONCAT(N'ClientAbsences initial failed: ', @msg);
         SELECT 'Initial' AS Stage, @Summary AS Summary;
         RETURN -50001;
     END CATCH
-END
+END;
+GO

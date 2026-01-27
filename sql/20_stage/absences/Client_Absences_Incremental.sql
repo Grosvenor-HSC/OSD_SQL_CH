@@ -23,15 +23,21 @@ Notes:
     - Downstream reporting assumes this data is current.
 */
 
-USE [DOM_LIVE]
-GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_ClientAbsences_Incremental]    Script Date: 26/01/2026 20:43:06 ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+/* ============================================================
+   File: Client_Absences_Incremental.sql
+   Refactor: InactiveReference + UUID + Client_UUID changed from NVARCHAR to INT
+   Source facts: INACTIVE_DY.INACT_REF is INT; INACTIVE_DY.CLIENT_REF is INT
+   ============================================================ */
+
+USE [DOM_LIVE];
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_ClientAbsences_Incremental]
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [dbo].[usp_Sync_ClientAbsences_Incremental]
     @ChunkSize         int  = 100000,
     @LockTimeoutMs     int  = 60000,
     @UseAppLock        bit  = 1,
@@ -51,7 +57,7 @@ BEGIN
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
 
-    -- Concurrency
+    /* Concurrency */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:ClientAbsences';
     DECLARE @LockOwner    sysname = N'Session';
     DECLARE @DbPrincipal  sysname = N'dbo';
@@ -71,11 +77,12 @@ BEGIN
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             RETURN @lockResult;
         END
+
         SET @lockHeld = 1;
     END
 
     BEGIN TRY
-        -- Preconditions
+        /* Preconditions */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
         BEGIN
             IF @EmitInfo=1 RAISERROR('CT not enabled at DB level.',16,1);
@@ -97,7 +104,7 @@ BEGIN
         DECLARE @CT_CHSYSDEC bit =
             CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC')) THEN 1 ELSE 0 END;
 
-        -- Watermark row
+        /* Watermark row */
         IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -116,7 +123,7 @@ BEGIN
 
         DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
 
-        -- Min valid across referenced tables
+        /* Min valid across referenced tables */
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
@@ -137,27 +144,25 @@ BEGIN
         END
 
         IF @EmitInfo=1
-        BEGIN
             RAISERROR('ClientAbsences CT window: From=%I64d To=%I64d',0,1,@LastSyncVersion,@ToVersion) WITH NOWAIT;
-        END
 
-        -- Build changed set
+        /* 2) Build changed set (INT keys) */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (InactiveReference nvarchar(55) NOT NULL PRIMARY KEY);
+        CREATE TABLE #Changed (InactiveReference INT NOT NULL PRIMARY KEY);
 
         INSERT INTO #Changed(InactiveReference)
-        SELECT DISTINCT CAST(x.INACT_REF AS nvarchar(55))
+        SELECT DISTINCT x.INACT_REF
         FROM CHANGETABLE(CHANGES dbo.INACTIVE_DY, @LastSyncVersion) x
         WHERE x.SYS_CHANGE_VERSION <= @ToVersion;
 
         IF @CT_CHSYSDEC = 1
         BEGIN
             INSERT INTO #Changed(InactiveReference)
-            SELECT DISTINCT CAST(idy.INACT_REF AS nvarchar(55))
+            SELECT DISTINCT idy.INACT_REF
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) d
             JOIN dbo.INACTIVE_DY idy ON idy.REASON = d.DECODE_REF
             WHERE d.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.InactiveReference = CAST(idy.INACT_REF AS nvarchar(55)));
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.InactiveReference = idy.INACT_REF);
         END
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on CHSYSDEC; Absence_Reason text changes won''t be tracked.',0,1) WITH NOWAIT;
@@ -180,19 +185,20 @@ BEGIN
                 N' UTC; inserted 0, updated 0, deleted 0; advanced watermark to ',
                 CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
             );
+
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
             IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
             RETURN 0;
         END
 
-        -- Chunked MERGE
+        /* 3) Chunked MERGE */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next (InactiveReference nvarchar(55) NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next (InactiveReference INT NOT NULL PRIMARY KEY);
 
             INSERT INTO #Next(InactiveReference)
             SELECT TOP (@ChunkSize) InactiveReference
@@ -205,17 +211,17 @@ BEGIN
             ;WITH Base AS
             (
                 SELECT
-                    UUID               = CAST(idy.INACT_REF AS nvarchar(55)),
-                    Client_UUID        = CAST(idy.CLIENT_REF AS nvarchar(55)),
-                    Absence_Reason     = NULLIF(LTRIM(RTRIM(cr.DESCRIPTION)), ''),
+                    UUID               = idy.INACT_REF,
+                    Client_UUID        = idy.CLIENT_REF,
+                    Absence_Reason     = NULLIF(LTRIM(RTRIM(cr.DESCRIPTION)), N''),
                     Absence_Start_Date = CAST(idy.START_DT AS date),
                     Absence_End_Date   = CAST(idy.END_DT   AS date)
                 FROM dbo.INACTIVE_DY idy
                 JOIN #Next n
-                  ON n.InactiveReference = CAST(idy.INACT_REF AS nvarchar(55))
+                  ON n.InactiveReference = idy.INACT_REF
                 LEFT JOIN dbo.CHSYSDEC cr
                   ON cr.DECODE_REF = idy.REASON
-                WHERE idy.rectype NOT IN ('S','R','E')   -- same filter as Initial
+                WHERE idy.rectype NOT IN ('S','R','E')
             )
             MERGE dbo.tbl_ClientAbsences AS tgt
             USING Base AS src
@@ -228,12 +234,18 @@ BEGIN
                     tgt.Absence_End_Date   = src.Absence_End_Date,
                     tgt.UpdatedAtUTC       = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
-                INSERT (UUID, Client_UUID, Absence_Reason,
-                        Absence_Start_Date, Absence_End_Date,
-                        CreatedAtUTC, UpdatedAtUTC)
-                VALUES (src.UUID, src.Client_UUID, src.Absence_Reason,
-                        src.Absence_Start_Date, src.Absence_End_Date,
-                        @RunStartedAt, @RunStartedAt)
+                INSERT
+                (
+                    UUID, Client_UUID, Absence_Reason,
+                    Absence_Start_Date, Absence_End_Date,
+                    CreatedAtUTC, UpdatedAtUTC
+                )
+                VALUES
+                (
+                    src.UUID, src.Client_UUID, src.Absence_Reason,
+                    src.Absence_Start_Date, src.Absence_End_Date,
+                    @RunStartedAt, @RunStartedAt
+                )
             WHEN NOT MATCHED BY SOURCE
                  AND EXISTS (SELECT 1 FROM #Next nn WHERE nn.InactiveReference = tgt.UUID)
                  THEN DELETE
@@ -259,7 +271,7 @@ BEGIN
             JOIN #Next n ON n.InactiveReference = c.InactiveReference;
         END
 
-        -- Advance watermark + summary
+        /* 4) Advance watermark + summary */
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
         WHERE ProcessName=@Process;
@@ -292,10 +304,14 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         IF @EmitInfo=1 RAISERROR('usp_Sync_ClientAbsences_Incremental failed: %s',16,1,@msg);
+
         SET @Summary = CONCAT(N'ClientAbsences incremental failed: ', @msg);
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+
         RETURN -50001;
     END CATCH
-END
+END;
+GO
