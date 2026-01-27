@@ -1,3 +1,29 @@
+/*
+Purpose:
+    Perform the initial full load of employee records into the staging employees table.
+    This establishes the baseline employee dataset for all downstream processing.
+
+Source:
+    Source employee tables/views (OSD / care system source).
+
+Target:
+    Staging employees table (e.g. dbo.tbl_Employees or equivalent).
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    This script reloads the entire employee history and may truncate or overwrite data.
+
+Notes:
+    - Must be run BEFORE all employee-related incrementals (branches, skills, start/leave dates).
+    - Must be run BEFORE visits, diaries, absences, and reporting loads.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Employees_Initial]    Script Date: 26/01/2026 20:46:09 ******/

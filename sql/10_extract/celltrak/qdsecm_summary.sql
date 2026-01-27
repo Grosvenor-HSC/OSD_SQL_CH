@@ -1,6 +1,39 @@
-/* =========================
-   0) RAW PULLS (unchanged inside OPENQUERY) 
-   ========================= */
+/*
+Purpose:
+    Pull recent CellTrak activity and produce stored summary tables for QDS ECM reporting:
+      - tbl_QDSStoredStaffSummary
+      - tbl_QDSStoredClientSummary
+      - tbl_QDSStoredOverallSummary
+
+Source:
+    Linked Server: [CELLTRAK] (OPENQUERY)
+      - CTVIEW_STD.ACTIVITY_DETAILS
+      - CTVIEW_STD.STAFF_DETAILS
+      - CTVIEW_STD.PATIENT_DETAILS
+      - CTVIEW_STD.FORM_RESPONSES
+      - CTVIEW_STD.ACTIVITY_FILTERS
+    Local temp tables created from raw pulls: #v_raw, #ex_raw, #miss_raw, #visits
+
+Target:
+    tbl_QDSStoredStaffSummary (drop/recreate) :contentReference[oaicite:26]{index=26}
+    tbl_QDSStoredClientSummary (drop/recreate) :contentReference[oaicite:27]{index=27}
+    tbl_QDSStoredOverallSummary (drop/recreate) :contentReference[oaicite:28]{index=28}
+
+Run type:
+    Rebuild (DROP + CREATE/SELECT INTO)
+
+Run frequency:
+    Weekly / scheduled (script currently pulls a specific historic window: scheduled_start_date BETWEEN -28 and -21 days). :contentReference[oaicite:29]{index=29}
+
+Safe to re-run:
+    Yes, but it will drop and recreate the stored summary tables.
+
+Notes:
+    - Raw pulls are executed unchanged inside OPENQUERY. :contentReference[oaicite:30]{index=30}
+    - Builds #visits once with derived minutes + flags (exception/missed/delivered + issues). :contentReference[oaicite:31]{index=31}
+    - Cleans up all temp tables at the end. :contentReference[oaicite:32]{index=32}
+*/
+
 
 SET NOCOUNT ON;
 

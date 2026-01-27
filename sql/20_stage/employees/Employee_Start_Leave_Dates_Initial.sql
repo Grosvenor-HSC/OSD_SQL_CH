@@ -1,3 +1,27 @@
+/*
+Purpose:
+    Perform the initial full load of employee start and leave date history.
+
+Source:
+    Source employee employment history tables/views.
+
+Target:
+    Staging employee start/leave dates table.
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+
+Notes:
+    - Used by reporting and workforce analytics.
+    - Must be run AFTER employees initial load.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeeStartLeaveDates_Initial]    Script Date: 26/01/2026 20:50:14 ******/

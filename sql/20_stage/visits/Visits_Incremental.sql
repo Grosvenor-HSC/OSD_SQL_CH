@@ -1,3 +1,31 @@
+/*
+Purpose:
+    Incrementally load new and updated visit records into the staging visits table
+    since the last successful run.
+
+Source:
+    Source visit tables/views (OSD / care system source).
+
+Target:
+    Staging visits table (e.g. dbo.tbl_Visits or equivalent).
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES, but depends on implementation.
+    (Safe if MERGE/NOT EXISTS logic is used; unsafe if duplicates are possible.)
+
+Notes:
+    - Relies on a date or last-modified column to identify new/changed visits.
+    - Must run AFTER related dimension/entity incrementals (branches, employees, clients).
+    - Downstream processes (visit distance, diaries, absences, reporting) assume this table
+      is complete and up to date.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Visits_Incremental]    Script Date: 26/01/2026 20:50:28 ******/

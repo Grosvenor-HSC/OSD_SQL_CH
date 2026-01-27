@@ -1,3 +1,35 @@
+/*
+Purpose:
+    Incrementally populate dbo.tbl_VisitsDistance with travel legs (from postcode -> to postcode) and distance
+    for each employee’s daily visit sequence (Home->First, between visits, Last->Home).
+
+Source:
+    dbo.tbl_Visits
+    dbo.tbl_Employees
+    dbo.tbl_Clients
+    dbo.ACTIVITY_VARS (Reason)
+    dbo.Distance_Matrix
+
+Target:
+    dbo.tbl_VisitsDistance (ACT_REF, frompcode, topcode, DISTANCE)
+
+Run type:
+    Incremental (insert-only)
+
+Run frequency:
+    Daily (or whenever tbl_Visits has new records)
+
+Safe to re-run:
+    Yes (uses NOT EXISTS to avoid duplicates) :contentReference[oaicite:4]{index=4}
+
+Notes:
+    - Incremental window starts at MAX(tbl_Visits.VisitStartDateTime) already present in tbl_VisitsDistance;
+      defaults to 1900-01-01 if target is empty. :contentReference[oaicite:5]{index=5}
+    - Excludes specific pay statuses/service codes and “NO MILES” postcodes. :contentReference[oaicite:6]{index=6}
+    - “Legs” are constructed per Employee + VisitDate using ROW_NUMBER/LAG and a final Last->Home leg. :contentReference[oaicite:7]{index=7}
+*/
+
+
 -- Incremental window
 DECLARE @Now   DATETIME2(0) = GETDATE();
 DECLARE @Since DATETIME2(0);

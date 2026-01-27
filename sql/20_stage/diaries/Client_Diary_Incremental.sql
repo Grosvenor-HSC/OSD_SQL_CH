@@ -1,3 +1,28 @@
+/*
+Purpose:
+    Incrementally load new and updated client diary records into the staging diary table.
+
+Source:
+    Source client diary tables/views (OSD / care system source).
+
+Target:
+    Staging client diary table.
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES, depending on implementation (MERGE / NOT EXISTS logic).
+
+Notes:
+    - Relies on date or last-modified logic.
+    - Must run AFTER clients incremental.
+    - Downstream reporting assumes this data is current.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_ClientDiary_Incremental]    Script Date: 26/01/2026 20:43:53 ******/

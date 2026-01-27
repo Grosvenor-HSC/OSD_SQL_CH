@@ -1,3 +1,31 @@
+/*
+Purpose:
+    Perform the initial full load of visit records into the staging visits table.
+    This establishes the baseline dataset used by all downstream visit processing.
+
+Source:
+    Source visit tables/views (OSD / care system source).
+
+Target:
+    Staging visits table (e.g. dbo.tbl_Visits or equivalent).
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only (or controlled re-run in non-production environments).
+
+Safe to re-run:
+    NO.
+    This script reloads the full visit history and may truncate or overwrite existing data.
+
+Notes:
+    - Must be run BEFORE any visit incremental scripts.
+    - Downstream processes (distance calculation, reporting, QDS) depend on this data.
+    - Re-running in production will invalidate historical reporting and should only be done
+      with explicit approval and downtime.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Visits_Initial]    Script Date: 26/01/2026 20:50:46 ******/

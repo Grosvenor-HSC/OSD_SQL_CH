@@ -1,3 +1,36 @@
+/*
+Purpose:
+    Build the QDS reporting table dbo.tbl_QDS (drop/recreate + reload) for Quick Discharge Service clients,
+    including visit counts/durations, double-ups, day-of-week and time-of-day breakdowns.
+
+Source:
+    tbl_Clients
+    tbl_ClientStartLeaveDates
+    tbl_Visits
+    tbl_Contracts
+    vw_ClientHours
+    tbl_Branch
+    dbo.fn_GetFullAddress
+
+Target:
+    dbo.tbl_QDS (full rebuild) :contentReference[oaicite:13]{index=13}
+
+Run type:
+    Rebuild (DROP + CREATE + INSERT)
+
+Run frequency:
+    Daily (recommended) or on-demand before QDS reporting refresh
+
+Safe to re-run:
+    Yes, but disruptive: it DROPs and recreates dbo.tbl_QDS. Do not run during report usage windows. :contentReference[oaicite:14]{index=14}
+
+Notes:
+    - Filters clients to a rolling window: Start >= (today-366) and End <= (today+7). :contentReference[oaicite:15]{index=15}
+    - Restricts to QDS fund source names ('Quick Discharge Service(s)') and invoice statuses (4,5). :contentReference[oaicite:16]{index=16} :contentReference[oaicite:17]{index=17}
+    - Produces multiple aggregates (double-up vs single-handed, DOW pivot, time-of-day buckets) before inserting. :contentReference[oaicite:18]{index=18} :contentReference[oaicite:19]{index=19}
+*/
+
+
 IF OBJECT_ID('dbo.tbl_QDS','U') IS NOT NULL
   DROP TABLE dbo.tbl_QDS;
 GO

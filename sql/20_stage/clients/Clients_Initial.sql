@@ -1,3 +1,31 @@
+/*
+Purpose:
+    Perform the initial full load of client records into the staging clients table.
+    This establishes the baseline client dataset for all downstream processing.
+
+Source:
+    Source client tables/views (OSD / care system source).
+
+Target:
+    Staging clients table (e.g. dbo.tbl_Clients or equivalent).
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only (or controlled re-run in non-production environments).
+
+Safe to re-run:
+    NO.
+    This script reloads the entire client history and may truncate or overwrite data.
+
+Notes:
+    - Must be run BEFORE client incremental scripts.
+    - Must be run BEFORE visit, diary, and absence initial loads.
+    - Re-running in production will invalidate historical reporting unless all downstream
+      data is rebuilt afterwards.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Clients_Initial]    Script Date: 26/01/2026 20:44:56 ******/

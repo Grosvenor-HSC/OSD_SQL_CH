@@ -1,3 +1,28 @@
+/*
+Purpose:
+    Incrementally load new and updated branch records into the staging branches table.
+
+Source:
+    Source branch tables/views (OSD / care system source).
+
+Target:
+    Staging branches table (e.g. dbo.tbl_Branch or equivalent).
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES, depending on implementation (MERGE / NOT EXISTS logic).
+
+Notes:
+    - Relies on date or last-modified logic to detect changes.
+    - Must run BEFORE employee, client, and visit incrementals.
+    - Downstream reporting assumes branch metadata is current.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Branch_Incremental]    Script Date: 26/01/2026 20:41:57 ******/

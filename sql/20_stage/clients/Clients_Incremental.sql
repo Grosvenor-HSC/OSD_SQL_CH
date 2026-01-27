@@ -1,3 +1,30 @@
+/*
+Purpose:
+    Incrementally load new and updated client records into the staging clients table
+    since the last successful run.
+
+Source:
+    Source client tables/views (OSD / care system source).
+
+Target:
+    Staging clients table (e.g. dbo.tbl_Clients or equivalent).
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES, depending on implementation.
+    (Safe if MERGE or NOT EXISTS logic is used.)
+
+Notes:
+    - Relies on a date or last-modified column to detect changes.
+    - Must run BEFORE visit, diary, and absence incrementals.
+    - Downstream reporting assumes this table reflects the current client state.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Clients_Incremental]    Script Date: 26/01/2026 20:44:38 ******/

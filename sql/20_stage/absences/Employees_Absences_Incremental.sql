@@ -1,3 +1,27 @@
+/*
+Purpose:
+    Incrementally load new and updated employee absence records into the staging absences table.
+
+Source:
+    Source employee absence tables/views (OSD / care system source).
+
+Target:
+    Staging employee absences table.
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES.
+
+Notes:
+    - Must run AFTER employees incremental.
+    - Used by workforce and compliance reporting.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesAbsences_Incremental]    Script Date: 26/01/2026 20:47:36 ******/

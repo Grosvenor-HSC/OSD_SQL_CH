@@ -1,3 +1,30 @@
+/*
+Purpose:
+    Perform the initial full load of client absence records into the staging absences table.
+    This establishes the baseline client absence dataset.
+
+Source:
+    Source client absence tables/views (OSD / care system source).
+
+Target:
+    Staging client absences table.
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    Reloads the full client absence history and may truncate or overwrite data.
+
+Notes:
+    - Must be run AFTER clients initial load.
+    - Must be run BEFORE absence incremental scripts.
+    - Used by compliance, utilisation, and reporting logic.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_ClientAbsences_Initial]    Script Date: 26/01/2026 20:43:27 ******/

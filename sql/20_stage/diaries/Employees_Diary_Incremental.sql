@@ -1,3 +1,27 @@
+/*
+Purpose:
+    Incrementally load new and updated employee diary records into the staging diary table.
+
+Source:
+    Source employee diary tables/views (OSD / care system source).
+
+Target:
+    Staging employee diary table.
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES.
+
+Notes:
+    - Must run AFTER employees incremental.
+    - Used by reporting and operational analysis.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesDiary_Incremental]    Script Date: 26/01/2026 20:48:31 ******/

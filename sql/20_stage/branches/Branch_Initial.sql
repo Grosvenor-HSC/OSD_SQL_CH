@@ -1,3 +1,30 @@
+/*
+Purpose:
+    Perform the initial full load of branch records into the staging branches table.
+    This establishes the baseline branch dataset used across all downstream processing.
+
+Source:
+    Source branch tables/views (OSD / care system source).
+
+Target:
+    Staging branches table (e.g. dbo.tbl_Branch or equivalent).
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    Reloads all branch records and may truncate or overwrite existing data.
+
+Notes:
+    - Must be run BEFORE employees, clients, visits, and all other entity initial loads.
+    - Branch identifiers are referenced by multiple downstream tables and reports.
+    - Re-running in production may require full downstream rebuilds.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Branch_Initial]    Script Date: 26/01/2026 20:42:34 ******/

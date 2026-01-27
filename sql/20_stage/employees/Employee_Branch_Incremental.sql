@@ -1,3 +1,26 @@
+/*
+Purpose:
+    Incrementally load new or changed employee-to-branch relationships.
+
+Source:
+    Source employee branch assignment tables/views.
+
+Target:
+    Staging employee-branch relationship table.
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES.
+
+Notes:
+    - Must run AFTER employee incremental.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeeBranch_Incremental]    Script Date: 26/01/2026 20:46:39 ******/

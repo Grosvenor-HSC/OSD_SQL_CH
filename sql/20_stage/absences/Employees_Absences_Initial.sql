@@ -1,3 +1,29 @@
+/*
+Purpose:
+    Perform the initial full load of employee absence records into the staging absences table.
+    This establishes the baseline employee absence dataset.
+
+Source:
+    Source employee absence tables/views (OSD / care system source).
+
+Target:
+    Staging employee absences table.
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    Reloads the full employee absence history.
+
+Notes:
+    - Must be run AFTER employees initial load.
+    - Must be run BEFORE employee absence incremental scripts.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesAbsences_Initial]    Script Date: 26/01/2026 20:47:53 ******/

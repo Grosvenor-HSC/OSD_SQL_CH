@@ -1,3 +1,28 @@
+/*
+Purpose:
+    Perform the initial full load of employee diary records into the staging diary table.
+
+Source:
+    Source employee diary tables/views (OSD / care system source).
+
+Target:
+    Staging employee diary table.
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    Reloads the full employee diary history.
+
+Notes:
+    - Must be run AFTER employees initial load.
+    - Must be run BEFORE employee diary incremental scripts.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesDiary_Initial]    Script Date: 26/01/2026 20:48:51 ******/

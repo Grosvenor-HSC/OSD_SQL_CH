@@ -1,3 +1,27 @@
+/*
+Purpose:
+    Perform the initial full load of employee-to-branch relationships.
+
+Source:
+    Source employee branch assignment tables/views.
+
+Target:
+    Staging employee-branch relationship table.
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    Reloads all employee-branch assignments.
+
+Notes:
+    - Must be run AFTER employees initial load.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeeBranch_Initial]    Script Date: 26/01/2026 20:46:57 ******/

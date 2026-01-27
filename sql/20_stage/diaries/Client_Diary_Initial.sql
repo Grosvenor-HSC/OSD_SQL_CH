@@ -1,3 +1,30 @@
+/*
+Purpose:
+    Perform the initial full load of client diary records into the staging diary table.
+    This establishes the baseline client diary dataset.
+
+Source:
+    Source client diary tables/views (OSD / care system source).
+
+Target:
+    Staging client diary table.
+
+Run type:
+    Initial (full backfill).
+
+Run frequency:
+    One-time only.
+
+Safe to re-run:
+    NO.
+    Reloads the full diary history and may truncate or overwrite data.
+
+Notes:
+    - Must be run AFTER clients initial load.
+    - Must be run BEFORE diary incremental scripts.
+    - Used by downstream reporting and compliance analysis.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_ClientDiary_Initial]    Script Date: 26/01/2026 20:44:12 ******/

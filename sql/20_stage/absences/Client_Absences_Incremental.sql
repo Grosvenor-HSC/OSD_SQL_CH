@@ -1,3 +1,28 @@
+/*
+Purpose:
+    Incrementally load new and updated client absence records into the staging absences table.
+
+Source:
+    Source client absence tables/views (OSD / care system source).
+
+Target:
+    Staging client absences table.
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES, depending on implementation (MERGE / NOT EXISTS logic).
+
+Notes:
+    - Relies on date or last-modified logic to detect changes.
+    - Must run AFTER clients incremental.
+    - Downstream reporting assumes this data is current.
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_ClientAbsences_Incremental]    Script Date: 26/01/2026 20:43:06 ******/

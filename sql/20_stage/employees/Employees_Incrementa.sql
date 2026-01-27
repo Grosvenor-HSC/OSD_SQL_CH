@@ -1,3 +1,27 @@
+/*
+Purpose:
+    Incrementally load new and updated employee records into the staging employees table.
+
+Source:
+    Source employee tables/views (OSD / care system source).
+
+Target:
+    Staging employees table (e.g. dbo.tbl_Employees or equivalent).
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES, depending on implementation (MERGE / NOT EXISTS logic).
+
+Notes:
+    - Relies on a date or last-modified column to detect changes.
+    - Must run BEFORE employee relationship incrementals (branch, skills, start/leave dates).
+*/
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_Employees_Incremental]    Script Date: 26/01/2026 20:45:52 ******/

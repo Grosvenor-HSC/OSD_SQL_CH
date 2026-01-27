@@ -1,3 +1,27 @@
+/*
+Purpose:
+    Incrementally load new or updated employee skill records.
+
+Source:
+    Source employee skills tables/views.
+
+Target:
+    Staging employee skills table.
+
+Run type:
+    Incremental.
+
+Run frequency:
+    Daily.
+
+Safe to re-run:
+    Usually YES.
+
+Notes:
+    - Must run AFTER employee incremental.
+*/
+
+
 USE [DOM_LIVE]
 GO
 /****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeeSkills_Incremental]    Script Date: 26/01/2026 20:49:18 ******/
