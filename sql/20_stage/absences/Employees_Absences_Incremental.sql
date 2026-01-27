@@ -22,15 +22,20 @@ Notes:
     - Used by workforce and compliance reporting.
 */
 
-USE [DOM_LIVE]
-GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesAbsences_Incremental]    Script Date: 26/01/2026 20:47:36 ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+/* ============================================================
+   File: Employees_Absences_Incremental.sql
+   Refactor: UUID (INACT_REF) changed from NVARCHAR(50) to INT end-to-end
+   ============================================================ */
+
+USE [DOM_LIVE];
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_EmployeesAbsences_Incremental]
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [dbo].[usp_Sync_EmployeesAbsences_Incremental]
     @ChunkSize        int  = 100000,
     @LockTimeoutMs    int  = 60000,
     @UseAppLock       bit  = 1,
@@ -112,7 +117,7 @@ BEGIN
         DECLARE @LastSyncVersion bigint =
             (SELECT LastSyncVersion FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process);
 
-        -- Make sure watermark is still valid for the CT window
+        /* Make sure watermark is still valid for the CT window */
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
@@ -140,30 +145,30 @@ BEGIN
             RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
         END
 
-        /* 2) Build changed set (keys = INACT_REF) */
+        /* 2) Build changed set (keys = INACT_REF INT) */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
         CREATE TABLE #Changed
         (
-            UUID nvarchar(50) NOT NULL PRIMARY KEY  -- matches target PK type
+            UUID INT NOT NULL PRIMARY KEY
         );
 
-        -- INACTIVE_DY inserted/updated
+        /* INACTIVE_DY inserted/updated */
         INSERT INTO #Changed(UUID)
-        SELECT DISTINCT CAST(idy.INACT_REF AS nvarchar(50))
+        SELECT DISTINCT idy.INACT_REF
         FROM CHANGETABLE(CHANGES dbo.INACTIVE_DY, @LastSyncVersion) ct
         JOIN dbo.INACTIVE_DY idy ON idy.INACT_REF = ct.INACT_REF
         WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
           AND ct.SYS_CHANGE_OPERATION IN ('I','U');
 
-        -- CHSYSDEC description changes that affect reasons used by INACTIVE_DY (optional)
+        /* CHSYSDEC description changes (optional) */
         IF @CT_CHSYSDEC = 1
         BEGIN
             INSERT INTO #Changed(UUID)
-            SELECT DISTINCT CAST(idy.INACT_REF AS nvarchar(50))
+            SELECT DISTINCT idy.INACT_REF
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) d
             JOIN dbo.INACTIVE_DY idy ON idy.REASON = d.DECODE_REF
             WHERE d.SYS_CHANGE_VERSION <= @ToVersion
-              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = CAST(idy.INACT_REF AS nvarchar(50)));
+              AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.UUID = idy.INACT_REF);
         END
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
@@ -175,10 +180,12 @@ BEGIN
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next(UUID nvarchar(50) NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next(UUID INT NOT NULL PRIMARY KEY);
 
             INSERT INTO #Next(UUID)
-            SELECT TOP (@ChunkSize) UUID FROM #Changed ORDER BY UUID;
+            SELECT TOP (@ChunkSize) UUID
+            FROM #Changed
+            ORDER BY UUID;
 
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
@@ -186,22 +193,22 @@ BEGIN
             ;WITH Base AS
             (
                 SELECT
-                    UUID            = CAST(idy.INACT_REF AS nvarchar(50)),
-                    Employee_UUID   = CAST(idy.EMP_REF   AS int),
-                    Reason          = cr.DESCRIPTION,
-                    [End_Date]      = idy.END_DTM,
-                    [Start_Date]    = idy.START_DTM,
-                    [Status]        = CASE idy.ALEAVESTAT
-                                        WHEN ''  THEN 'Entered'
-                                        WHEN 'C' THEN 'Confirmed'
-                                        WHEN 'P' THEN 'Part-Paid'
-                                        WHEN 'F' THEN 'Fully-Paid'
-                                        ELSE 'Unknown'
-                                      END,
-                    Comment         = idy.COMMENT
+                    UUID          = idy.INACT_REF,
+                    Employee_UUID = CAST(idy.EMP_REF AS int),
+                    Reason        = cr.DESCRIPTION,
+                    [End_Date]    = idy.END_DTM,
+                    [Start_Date]  = idy.START_DTM,
+                    [Status]      = CASE idy.ALEAVESTAT
+                                      WHEN ''  THEN 'Entered'
+                                      WHEN 'C' THEN 'Confirmed'
+                                      WHEN 'P' THEN 'Part-Paid'
+                                      WHEN 'F' THEN 'Fully-Paid'
+                                      ELSE 'Unknown'
+                                    END,
+                    Comment       = idy.COMMENT
                 FROM dbo.INACTIVE_DY idy
-                JOIN #Next n                ON n.UUID = CAST(idy.INACT_REF AS nvarchar(50))
-                LEFT JOIN dbo.CHSYSDEC cr   ON cr.DECODE_REF = idy.REASON
+                JOIN #Next n              ON n.UUID = idy.INACT_REF
+                LEFT JOIN dbo.CHSYSDEC cr ON cr.DECODE_REF = idy.REASON
             )
             MERGE dbo.tbl_EmployeesAbsences AS tgt
             USING Base AS src
@@ -236,17 +243,18 @@ BEGIN
 
         /* 4) Apply deletes from INACTIVE_DY */
         IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
-        CREATE TABLE #DelLog(UUID nvarchar(50) NOT NULL);
+        CREATE TABLE #DelLog(UUID INT NOT NULL);
 
         DELETE t
         OUTPUT DELETED.UUID INTO #DelLog(UUID)
         FROM dbo.tbl_EmployeesAbsences t
-        JOIN (
+        JOIN
+        (
             SELECT d.INACT_REF
             FROM CHANGETABLE(CHANGES dbo.INACTIVE_DY, @LastSyncVersion) d
             WHERE d.SYS_CHANGE_OPERATION='D'
               AND d.SYS_CHANGE_VERSION   <= @ToVersion
-        ) x ON t.UUID = CAST(x.INACT_REF AS nvarchar(50));
+        ) x ON t.UUID = x.INACT_REF;
 
         SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
         IF @EmitInfo=1 RAISERROR('Deleted due to source deletes: %d', 0, 1, @TotalDeleted) WITH NOWAIT;
@@ -275,20 +283,30 @@ BEGIN
             RAISERROR('  Deleted  = %d', 0, 1, @TotalDeleted) WITH NOWAIT;
         END
 
-        IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+        IF @ReturnSummaryRow=1
+            SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
 FinallyRelease:
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+
         RETURN 0;
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
-        IF @EmitInfo=1 RAISERROR('usp_Sync_EmployeesAbsences_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',16,1,@num,@sev,@st,@procName,@lin,@msg);
+
+        IF @EmitInfo=1
+            RAISERROR('usp_Sync_EmployeesAbsences_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
+                      16,1,@num,@sev,@st,@procName,@lin,@msg);
+
         SET @Summary = CONCAT(N'EmployeesAbsences incremental failed: ', @msg);
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;
     END CATCH
-END
+END;
+GO

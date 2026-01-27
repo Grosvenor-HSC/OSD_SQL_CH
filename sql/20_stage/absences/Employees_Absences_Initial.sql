@@ -24,15 +24,20 @@ Notes:
     - Must be run BEFORE employee absence incremental scripts.
 */
 
-USE [DOM_LIVE]
-GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesAbsences_Initial]    Script Date: 26/01/2026 20:47:53 ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+/* ============================================================
+   File: Employees_Absences_Initial.sql
+   Refactor: UUID (INACT_REF) changed from NVARCHAR(50) to INT
+   ============================================================ */
+
+USE [DOM_LIVE];
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_EmployeesAbsences_Initial]
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [dbo].[usp_Sync_EmployeesAbsences_Initial]
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -54,11 +59,12 @@ BEGIN
         @LockMode    = 'Exclusive',
         @LockOwner   = @LockOwner,
         @DbPrincipal = @DbPrincipal,
-        @LockTimeout = 600000;  -- 10 mins
+        @LockTimeout = 600000;
 
     IF @lockResult NOT IN (0,1)
     BEGIN
-        SELECT 'Initial' AS Stage, CAST(N'EmployeesAbsences initial failed: could not acquire applock.' AS nvarchar(4000)) AS Summary;
+        SELECT 'Initial' AS Stage,
+               CAST(N'EmployeesAbsences initial failed: could not acquire applock.' AS nvarchar(4000)) AS Summary;
         RETURN -1;
     END
     SET @lockHeld = 1;
@@ -91,7 +97,8 @@ BEGIN
         WHEN MATCHED THEN
           UPDATE SET LastSyncVersion = @BaselineFrom, LastSyncTime = SYSUTCDATETIME()
         WHEN NOT MATCHED THEN
-          INSERT (ProcessName, LastSyncVersion, LastSyncTime) VALUES (@Process, @BaselineFrom, SYSUTCDATETIME());
+          INSERT (ProcessName, LastSyncVersion, LastSyncTime)
+          VALUES (@Process, @BaselineFrom, SYSUTCDATETIME());
 
         /* 4) Recreate target table */
         IF OBJECT_ID('dbo.tbl_EmployeesAbsences', 'U') IS NOT NULL
@@ -99,12 +106,12 @@ BEGIN
 
         CREATE TABLE dbo.tbl_EmployeesAbsences
         (
-            Employee_UUID   INT             NOT NULL,   -- aligns with EMPLOYEE.EMP_REF and tbl_Employees.UUID
+            Employee_UUID   INT             NOT NULL,   -- EMP_REF
             Reason          NVARCHAR(255)   NULL,
             [End_Date]      DATETIME        NULL,
             [Start_Date]    DATETIME        NULL,
             [Status]        NVARCHAR(50)    NULL,
-            UUID            NVARCHAR(50)    NOT NULL,   -- source key (INACT_REF); keep as nvarchar for safety
+            UUID            INT             NOT NULL,   -- INACT_REF (INT)
             Comment         NVARCHAR(MAX)   NULL,
             CreatedAtUTC    datetime2(3)    NOT NULL CONSTRAINT DF_tbl_EmployeesAbsences_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
             UpdatedAtUTC    datetime2(3)    NOT NULL CONSTRAINT DF_tbl_EmployeesAbsences_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
@@ -119,24 +126,26 @@ BEGIN
             Employee_UUID, Reason, [End_Date], [Start_Date], [Status], UUID, Comment,
             CreatedAtUTC, UpdatedAtUTC
         )
-        SELECT 
-            CAST(IDY.EMP_REF AS INT)                           AS Employee_UUID,
-            CR.DESCRIPTION                                     AS Reason,
-            IDY.END_DTM                                        AS [End_Date],
-            IDY.START_DTM                                      AS [Start_Date],
+        SELECT
+            CAST(IDY.EMP_REF AS INT)               AS Employee_UUID,
+            CR.DESCRIPTION                         AS Reason,
+            IDY.END_DTM                            AS [End_Date],
+            IDY.START_DTM                          AS [Start_Date],
             CASE IDY.ALEAVESTAT
                  WHEN ''  THEN 'Entered'
                  WHEN 'C' THEN 'Confirmed'
                  WHEN 'P' THEN 'Part-Paid'
                  WHEN 'F' THEN 'Fully-Paid'
                  ELSE 'Unknown'
-            END                                                AS [Status],
-            CAST(IDY.INACT_REF AS NVARCHAR(50))                AS UUID,
-            IDY.COMMENT                                        AS Comment,
+            END                                    AS [Status],
+            IDY.INACT_REF                          AS UUID,        -- INT now
+            IDY.COMMENT                            AS Comment,
             @RunStartedAt, @RunStartedAt
         FROM dbo.INACTIVE_DY AS IDY WITH (NOLOCK)
-        LEFT JOIN dbo.CHSYSDEC     AS CR WITH (NOLOCK)  ON CR.DECODE_REF = IDY.REASON
-        LEFT JOIN dbo.tbl_Employees AS E WITH (NOLOCK)  ON E.UUID = IDY.EMP_REF   -- <- align to new Employees table
+        LEFT JOIN dbo.CHSYSDEC AS CR WITH (NOLOCK)
+               ON CR.DECODE_REF = IDY.REASON
+        LEFT JOIN dbo.tbl_Employees AS E WITH (NOLOCK)
+               ON E.UUID = IDY.EMP_REF
         WHERE IDY.EMP_REF <> 0
           AND IDY.rectype = 'E'
           AND (CR.DESCRIPTION IS NULL OR CR.DESCRIPTION NOT IN ('From Another Branch','Input Error','Resigned ','Do not use'));
@@ -147,8 +156,9 @@ BEGIN
         /* 6) Indexes after load */
         CREATE NONCLUSTERED INDEX IX_EmployeesAbsences_Employee
             ON dbo.tbl_EmployeesAbsences (Employee_UUID);
+
         CREATE NONCLUSTERED INDEX IX_EmployeesAbsences_Start
-            ON dbo.tbl_EmployeesAbsences (Start_Date);
+            ON dbo.tbl_EmployeesAbsences ([Start_Date]);
 
         /* 7) Compose summary and (optionally) kick incremental */
         DECLARE @EndInitialUTC datetime2(3) = SYSUTCDATETIME();
@@ -177,7 +187,7 @@ BEGIN
                 IF @IncrMsg = N'' SET @IncrMsg = CONCAT(N'EmployeesAbsences incremental ran (rc=', @rc, N').');
             END TRY
             BEGIN CATCH
-                -- Fallback if signature differs
+                -- fallback legacy signature
                 BEGIN TRY
                     SET @rc = 0;
                     EXEC @rc = dbo.usp_Sync_EmployeesAbsences_Incremental
@@ -193,20 +203,23 @@ BEGIN
             END CATCH
         END
 
-        -- Return exactly TWO rows like your other initials
         SELECT 'Initial' AS Stage,     @InitialMsg AS Summary
         UNION ALL
         SELECT 'Incremental',          @IncrMsg;
 
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+
         RETURN 0;
 
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
 
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         SELECT 'Initial' AS Stage, CAST(CONCAT(N'EmployeesAbsences initial failed: ', @msg) AS nvarchar(4000)) AS Summary;
         RETURN -50001;
     END CATCH
-END
+END;
+GO
