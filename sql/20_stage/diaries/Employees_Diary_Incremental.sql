@@ -22,15 +22,24 @@ Notes:
     - Used by reporting and operational analysis.
 */
 
-USE [DOM_LIVE]
-GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeesDiary_Incremental]    Script Date: 26/01/2026 20:48:31 ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+/* ============================================================
+   File: Employees_Diary_Incremental.sql
+   Refactor: Ensure Employee_UUID is INT in Base (remove nvarchar cast)
+   Notes:
+     - #Changed uses EMP_DY_REF INT keys
+     - MERGE targets dbo.tbl_EmployeesDiary with INT keys
+     - Includes delete handling via CHANGETABLE deletes
+   ============================================================ */
+
+USE [DOM_LIVE];
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_EmployeesDiary_Incremental]
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [dbo].[usp_Sync_EmployeesDiary_Incremental]
     @ChunkSize        int  = 100000,
     @LockTimeoutMs    int  = 60000,
     @UseAppLock       bit  = 1,
@@ -49,7 +58,7 @@ BEGIN
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
 
-    -- concurrency
+    /* concurrency */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:EmployeesDiary';
     DECLARE @LockOwner    sysname = N'Session';
     DECLARE @DbPrincipal  sysname = N'dbo';
@@ -141,15 +150,13 @@ BEGIN
 
         /* Build changed set (by EMP_DY_REF) */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (EmpDyRef int NOT NULL PRIMARY KEY);  -- EMP_DY_REF
+        CREATE TABLE #Changed (EmpDyRef int NOT NULL PRIMARY KEY);
 
-        -- EMPLOYEE_DY changes
         INSERT INTO #Changed(EmpDyRef)
         SELECT DISTINCT x.EMP_DY_REF
         FROM CHANGETABLE(CHANGES dbo.EMPLOYEE_DY, @LastSyncVersion) x
         WHERE x.SYS_CHANGE_VERSION <= @ToVersion;
 
-        -- CHSYSDEC changes (optional) -> reprocess rows whose ENTRY_TYPE decode changed
         IF @CT_CHSYSDEC = 1
         BEGIN
             INSERT INTO #Changed(EmpDyRef)
@@ -185,7 +192,7 @@ BEGIN
             GOTO FinallyRelease;
         END
 
-        /* Resolve actual target column names */
+        /* Resolve actual target column names (kept from your original) */
         DECLARE @ColEmp sysname =
             CASE
                 WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Employee_UUID')     IS NOT NULL THEN 'Employee_UUID'
@@ -195,23 +202,20 @@ BEGIN
 
         DECLARE @ColRef sysname =
             CASE
-                WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','UUID')                  IS NOT NULL THEN 'UUID'
+                WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','UUID')                   IS NOT NULL THEN 'UUID'
                 WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','EmployeeDiaryReference') IS NOT NULL THEN 'EmployeeDiaryReference'
-                WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','EMP_DY_REF')            IS NOT NULL THEN 'EMP_DY_REF'
+                WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','EMP_DY_REF')             IS NOT NULL THEN 'EMP_DY_REF'
                 ELSE NULL
             END;
 
-        DECLARE @ColEntryDate  sysname =
-            CASE WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Entry_Date')  IS NOT NULL THEN 'Entry_Date'  ELSE NULL END;
-        DECLARE @ColReviewDate sysname =
-            CASE WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Review_Date') IS NOT NULL THEN 'Review_Date' ELSE NULL END;
-        DECLARE @ColEntryType  sysname =
-            CASE WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Entry_Type')  IS NOT NULL THEN 'Entry_Type'  ELSE NULL END;
+        DECLARE @ColEntryDate  sysname = CASE WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Entry_Date')  IS NOT NULL THEN 'Entry_Date'  ELSE NULL END;
+        DECLARE @ColReviewDate sysname = CASE WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Review_Date') IS NOT NULL THEN 'Review_Date' ELSE NULL END;
+        DECLARE @ColEntryType  sysname = CASE WHEN COL_LENGTH('dbo.tbl_EmployeesDiary','Entry_Type')  IS NOT NULL THEN 'Entry_Type'  ELSE NULL END;
 
         IF @ColEmp IS NULL OR @ColRef IS NULL OR @ColEntryDate IS NULL OR @ColReviewDate IS NULL OR @ColEntryType IS NULL
         BEGIN
             DECLARE @missing nvarchar(400) = N'';
-            IF @ColEmp IS NULL        SET @missing += N' Employee(UUID) ';
+            IF @ColEmp IS NULL        SET @missing += N' Employee_UUID ';
             IF @ColRef IS NULL        SET @missing += N' UUID ';
             IF @ColEntryDate IS NULL  SET @missing += N' Entry_Date ';
             IF @ColReviewDate IS NULL SET @missing += N' Review_Date ';
@@ -222,7 +226,7 @@ BEGIN
             GOTO FinallyRelease;
         END
 
-        /* Chunked upsert via dynamic SQL */
+        /* Chunked upsert */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
@@ -238,11 +242,12 @@ BEGIN
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
+            /* IMPORTANT FIX: Employee_UUID is INT (no nvarchar cast) */
             DECLARE @sql nvarchar(max) = N'
 ;WITH Base AS
 (
     SELECT
-        Employee_UUID = CAST(edy.EMP_REF AS nvarchar(50)),
+        Employee_UUID = edy.EMP_REF,
         EmpDyRef      = edy.EMP_DY_REF,
         Entry_Date    = edy.ENTRY_DATE,
         Review_Date   = edy.REVIEW_DATE,
@@ -250,7 +255,7 @@ BEGIN
     FROM dbo.EMPLOYEE_DY edy
     JOIN #Next n ON n.EmpDyRef = edy.EMP_DY_REF
     LEFT JOIN dbo.CHSYSDEC cet ON cet.DECODE_REF = edy.ENTRY_TYPE
-    where edy.EMP_REF <> 0
+    WHERE edy.EMP_REF <> 0
 )
 MERGE dbo.tbl_EmployeesDiary AS tgt
 USING Base AS src
@@ -290,7 +295,7 @@ OUTPUT $action INTO #ActLog(Action);';
             JOIN #Next n ON n.EmpDyRef = c.EmpDyRef;
         END
 
-        /* Hard deletes from source (EMPLOYEE_DY deletes) */
+        /* Apply deletes from EMPLOYEE_DY */
         IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
         CREATE TABLE #DelLog(Ref int NOT NULL);
 
@@ -335,18 +340,26 @@ JOIN (
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
 FinallyRelease:
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+
         RETURN 0;
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
-        IF @EmitInfo=1 RAISERROR('usp_Sync_EmployeesDiary_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
-                                 16,1,@num,@sev,@st,@procName,@lin,@msg);
+
+        IF @EmitInfo=1
+            RAISERROR('usp_Sync_EmployeesDiary_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
+                      16,1,@num,@sev,@st,@procName,@lin,@msg);
+
         SET @Summary = CONCAT(N'EmployeesDiary incremental failed: ', @msg);
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;
     END CATCH
-END
+END;
+GO
