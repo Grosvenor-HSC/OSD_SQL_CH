@@ -21,26 +21,42 @@ Notes:
     - Must run AFTER employee incremental.
 */
 
-USE [DOM_LIVE]
-GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_EmployeeBranch_Incremental]    Script Date: 26/01/2026 20:46:39 ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+/* ============================================================
+   File: Employee_Branch_Incremental.sql
+   Refactor: Branch keys moved from VARCHAR to INT
+     - #Changed Old_Branch_UUID INT
+     - Target Branch_UUID INT
+     - Removes string comparisons for 1970000043
+   ============================================================ */
+
+/* ============================================================
+   File: Employee_Branch_Incremental.sql
+   Refactor: Branch keys moved from VARCHAR to INT
+     - #Changed Old_Branch_UUID INT
+     - Target Branch_UUID INT
+     - Removes string comparisons for 1970000043
+   ============================================================ */
+
+USE [DOM_LIVE];
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_EmployeeBranch_Incremental]
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+ALTER PROCEDURE [dbo].[usp_Sync_EmployeeBranch_Incremental]
     @ChunkSize        int  = 100000,
     @LockTimeoutMs    int  = 60000,
     @UseAppLock       bit  = 1,
-    @EmitInfo         bit  = 1,                         -- 0=quiet, 1=progress
-    @Summary          nvarchar(4000) = NULL OUTPUT,     -- one-line summary
-    @ReturnSummaryRow bit  = 1                          -- return Stage/Summary row
+    @EmitInfo         bit  = 1,
+    @Summary          nvarchar(4000) = NULL OUTPUT,
+    @ReturnSummaryRow bit  = 1
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-    SET ANSI_WARNINGS ON;  -- for computed column + indexes
+    SET ANSI_WARNINGS ON;
 
     DECLARE @Process       sysname      = N'EmployeeBranch';
     DECLARE @RunStartedAt  datetime2(3) = SYSUTCDATETIME();
@@ -49,7 +65,7 @@ BEGIN
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
 
-    /* 0) Concurrency guard */
+    /* Concurrency guard */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:EmployeeBranch';
     DECLARE @LockOwner   sysname = N'Session';
     DECLARE @DbPrincipal sysname = N'dbo';
@@ -76,7 +92,7 @@ BEGIN
     END
 
     BEGIN TRY
-        /* 1) Preconditions & bounds */
+        /* Preconditions */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
         BEGIN
             IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
@@ -87,7 +103,7 @@ BEGIN
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.DISTKEY'))
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.DISTKEY. Cannot proceed.',16,1);
+            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.DISTKEY.',16,1);
             SET @Summary = N'EmployeeBranch incremental failed: CT not enabled on dbo.DISTKEY.';
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             GOTO FinallyRelease;
@@ -95,10 +111,11 @@ BEGIN
 
         DECLARE @CT_EMPLOYEE bit =
             CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.EMPLOYEE')) THEN 1 ELSE 0 END;
+
         DECLARE @CT_CHSYSDEC bit =
             CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC')) THEN 1 ELSE 0 END;
 
-        -- Watermark table
+        /* Watermark */
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -115,7 +132,7 @@ BEGIN
         DECLARE @LastSyncVersion bigint =
             (SELECT LastSyncVersion FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process);
 
-        -- Min valid across referenced CT tables
+        /* Min valid across referenced CT tables */
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
@@ -129,7 +146,7 @@ BEGIN
 
         IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) older than CT min valid (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
+            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
             SET @Summary = CONCAT(N'EmployeeBranch incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N' (re-baseline).');
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             GOTO FinallyRelease;
@@ -144,16 +161,16 @@ BEGIN
             RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
         END
 
-        /* 2) Build changed (Employee_UUID, Old_Branch_UUID) pairs */
+        /* Build changed (Employee_UUID, Old_Branch_UUID) pairs */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
         CREATE TABLE #Changed
         (
-            Employee_UUID      int          NOT NULL,
-            Old_Branch_UUID    varchar(20)  NOT NULL,
+            Employee_UUID      INT NOT NULL,
+            Old_Branch_UUID    INT NOT NULL,
             PRIMARY KEY (Employee_UUID, Old_Branch_UUID)
         );
 
-        -- 2a) From DISTKEY using dynamic PK-join (safe for composite PKs)
+        /* From DISTKEY using dynamic PK join */
         DECLARE @join nvarchar(max);
         DECLARE @sql  nvarchar(max);
 
@@ -180,18 +197,18 @@ BEGIN
                    FROM @pkcols ORDER BY ord FOR XML PATH(''), TYPE).value('.','nvarchar(max)'),1,5,'');
 
         SET @sql = N'
-            INSERT INTO #Changed(Employee_UUID, Old_Branch_UUID)
-            SELECT DISTINCT dk.INPRIKEY, dk.OUTPRIKEY
-            FROM CHANGETABLE(CHANGES dbo.DISTKEY, @LastSyncVersion) ct
-            JOIN dbo.DISTKEY dk ON ' + @join + N'
-            WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
-              AND ct.SYS_CHANGE_OPERATION IN (''I'',''U'');';
+INSERT INTO #Changed(Employee_UUID, Old_Branch_UUID)
+SELECT DISTINCT dk.INPRIKEY, dk.OUTPRIKEY
+FROM CHANGETABLE(CHANGES dbo.DISTKEY, @LastSyncVersion) ct
+JOIN dbo.DISTKEY dk ON ' + @join + N'
+WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
+  AND ct.SYS_CHANGE_OPERATION IN (''I'',''U'');';
 
         EXEC sp_executesql @sql,
             N'@LastSyncVersion bigint, @ToVersion bigint',
             @LastSyncVersion=@LastSyncVersion, @ToVersion=@ToVersion;
 
-        -- 2b) EMPLOYEE changes (optional)
+        /* EMPLOYEE changes (optional) */
         IF @CT_EMPLOYEE = 1
         BEGIN
             INSERT INTO #Changed(Employee_UUID, Old_Branch_UUID)
@@ -205,10 +222,9 @@ BEGIN
         ELSE IF @EmitInfo=1
             RAISERROR('Note: CT not enabled on EMPLOYEE; location-driven changes may be delayed.', 0, 1) WITH NOWAIT;
 
-        -- 2c) CHSYSDEC changes (optional)
+        /* CHSYSDEC changes (optional) */
         IF @CT_CHSYSDEC = 1
         BEGIN
-            -- from DISTKEY decodes
             INSERT INTO #Changed(Employee_UUID, Old_Branch_UUID)
             SELECT DISTINCT dk.INPRIKEY, dk.OUTPRIKEY
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) cd
@@ -220,7 +236,6 @@ BEGIN
             WHERE cd.SYS_CHANGE_VERSION <= @ToVersion
               AND NOT EXISTS (SELECT 1 FROM #Changed z WHERE z.Employee_UUID = dk.INPRIKEY AND z.Old_Branch_UUID = dk.OUTPRIKEY);
 
-            -- from EMPLOYEE location decode
             INSERT INTO #Changed(Employee_UUID, Old_Branch_UUID)
             SELECT DISTINCT dk.INPRIKEY, dk.OUTPRIKEY
             FROM CHANGETABLE(CHANGES dbo.CHSYSDEC, @LastSyncVersion) cd
@@ -251,50 +266,47 @@ BEGIN
                 CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
             );
 
-            IF @EmitInfo=1 RAISERROR('No changes. Watermark advanced.', 0, 1) WITH NOWAIT;
             IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
             GOTO FinallyRelease;
         END
 
-        /* 2d) Optional visit enrichment (dynamic) */
+        /* Optional visit enrichment */
         IF OBJECT_ID('tempdb..#VisitsAgg') IS NOT NULL DROP TABLE #VisitsAgg;
         CREATE TABLE #VisitsAgg
         (
-            Employee_UUID        INT         NOT NULL,
-            Old_Branch_UUID      VARCHAR(20) NOT NULL,
-            FirstVisitStartDate  DATETIME    NULL,
-            LastVisitEndDate     DATETIME    NULL,
+            Employee_UUID        INT      NOT NULL,
+            Old_Branch_UUID      INT      NOT NULL,
+            FirstVisitStartDate  DATETIME NULL,
+            LastVisitEndDate     DATETIME NULL,
             PRIMARY KEY (Employee_UUID, Old_Branch_UUID)
         );
 
-        DECLARE @hasVisits bit = CASE WHEN OBJECT_ID('dbo.tbl_Visits','U') IS NOT NULL THEN 1 ELSE 0 END;
-        IF @hasVisits = 1
+        IF OBJECT_ID('dbo.tbl_Visits','U') IS NOT NULL
+           AND COL_LENGTH('dbo.tbl_Visits','Employee_UUID')   IS NOT NULL
+           AND COL_LENGTH('dbo.tbl_Visits','Branch_UUID')     IS NOT NULL
+           AND COL_LENGTH('dbo.tbl_Visits','VisitStartDate')  IS NOT NULL
+           AND COL_LENGTH('dbo.tbl_Visits','VisitEndDate')    IS NOT NULL
         BEGIN
-            DECLARE @hasCols bit =
-                CASE WHEN COL_LENGTH('dbo.tbl_Visits','Employee_UUID')   IS NOT NULL
-                       AND COL_LENGTH('dbo.tbl_Visits','Branch_UUID')    IS NOT NULL
-                       AND COL_LENGTH('dbo.tbl_Visits','VisitStartDate') IS NOT NULL
-                       AND COL_LENGTH('dbo.tbl_Visits','VisitEndDate')   IS NOT NULL
-                     THEN 1 ELSE 0 END;
-
-            IF @hasCols = 1
-            BEGIN
-                DECLARE @vsql nvarchar(max) = N'
-                    INSERT INTO #VisitsAgg (Employee_UUID, Old_Branch_UUID, FirstVisitStartDate, LastVisitEndDate)
-                    SELECT
-                        v.Employee_UUID,
-                        b.Old_Branch_UUID,
-                        MIN(v.VisitStartDate),
-                        MAX(v.VisitEndDate)
-                    FROM dbo.tbl_Visits v
-                    JOIN dbo.tbl_Branch b ON v.Branch_UUID = b.UUID
-                    WHERE EXISTS (SELECT 1 FROM #Changed c WHERE c.Employee_UUID = v.Employee_UUID AND c.Old_Branch_UUID = b.Old_Branch_UUID)
-                    GROUP BY v.Employee_UUID, b.Old_Branch_UUID;';
-                EXEC sys.sp_executesql @vsql;
-            END
+            DECLARE @vsql nvarchar(max) = N'
+INSERT INTO #VisitsAgg (Employee_UUID, Old_Branch_UUID, FirstVisitStartDate, LastVisitEndDate)
+SELECT
+    v.Employee_UUID,
+    b.Old_Branch_UUID,
+    MIN(v.VisitStartDate),
+    MAX(v.VisitEndDate)
+FROM dbo.tbl_Visits v
+JOIN dbo.tbl_Branch b ON v.Branch_UUID = b.UUID
+WHERE EXISTS (
+    SELECT 1
+    FROM #Changed c
+    WHERE c.Employee_UUID = v.Employee_UUID
+      AND c.Old_Branch_UUID = b.Old_Branch_UUID
+)
+GROUP BY v.Employee_UUID, b.Old_Branch_UUID;';
+            EXEC sys.sp_executesql @vsql;
         END
 
-        /* 3) Chunked UPSERT into dbo.tbl_EmployeeBranch */
+        /* Chunked UPSERT */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
@@ -302,8 +314,8 @@ BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
             CREATE TABLE #Next
             (
-                Employee_UUID    int         NOT NULL,
-                Old_Branch_UUID  varchar(20) NOT NULL,
+                Employee_UUID    INT NOT NULL,
+                Old_Branch_UUID  INT NOT NULL,
                 PRIMARY KEY (Employee_UUID, Old_Branch_UUID)
             );
 
@@ -331,13 +343,18 @@ BEGIN
                   ON n.Employee_UUID   = dk.INPRIKEY
                  AND n.Old_Branch_UUID = dk.OUTPRIKEY
             ),
-            Emp AS (
+            Emp AS
+            (
                 SELECT e.EMP_REF, e.GS_REF, e.LOCATION_REF AS EMP_LOC_REF
                 FROM dbo.EMPLOYEE e
                 WHERE EXISTS (SELECT 1 FROM #Next n WHERE n.Employee_UUID = e.EMP_REF)
             ),
-            Lookups AS ( SELECT d.DECODE_REF, d.DESCRIPTION FROM dbo.CHSYSDEC d ),
-            Base AS (
+            Lookups AS
+            (
+                SELECT d.DECODE_REF, d.DESCRIPTION FROM dbo.CHSYSDEC d
+            ),
+            Base AS
+            (
                 SELECT
                     dk.Employee_UUID,
                     dk.Old_Branch_UUID,
@@ -356,20 +373,20 @@ BEGIN
                     va.FirstVisitStartDate,
                     va.LastVisitEndDate
                 FROM DKRows dk
-                LEFT JOIN Emp e            ON e.EMP_REF       = dk.Employee_UUID
-                LEFT JOIN Lookups EL       ON EL.DECODE_REF   = e.EMP_LOC_REF
-                LEFT JOIN Lookups ES       ON ES.DECODE_REF   = dk.DK_STATUS
-                LEFT JOIN Lookups ECG      ON ECG.DECODE_REF  = dk.CARE_GRP_REF
-                LEFT JOIN Lookups ELR      ON ELR.DECODE_REF  = dk.LEFTREASON
-                LEFT JOIN Lookups EBL      ON EBL.DECODE_REF  = dk.LOCATION_REF
-                LEFT JOIN #VisitsAgg va    ON va.Employee_UUID   = dk.Employee_UUID
-                                          AND va.Old_Branch_UUID = dk.Old_Branch_UUID
+                LEFT JOIN Emp e         ON e.EMP_REF      = dk.Employee_UUID
+                LEFT JOIN Lookups EL    ON EL.DECODE_REF  = e.EMP_LOC_REF
+                LEFT JOIN Lookups ES    ON ES.DECODE_REF  = dk.DK_STATUS
+                LEFT JOIN Lookups ECG   ON ECG.DECODE_REF = dk.CARE_GRP_REF
+                LEFT JOIN Lookups ELR   ON ELR.DECODE_REF = dk.LEFTREASON
+                LEFT JOIN Lookups EBL   ON EBL.DECODE_REF = dk.LOCATION_REF
+                LEFT JOIN #VisitsAgg va ON va.Employee_UUID   = dk.Employee_UUID
+                                       AND va.Old_Branch_UUID = dk.Old_Branch_UUID
             ),
-            Shaped AS (
+            Shaped AS
+            (
                 SELECT
                     b.Employee_UUID,
-
-                    Branch_UUID = CAST(pick.Branch_UUID AS varchar(55)),
+                    Branch_UUID = pick.Branch_UUID,
                     Branch_Name = pick.Branch_Name,
 
                     Start_Date =
@@ -394,30 +411,30 @@ BEGIN
 
                     Main_Branch  = CASE WHEN b.Old_Branch_UUID = b.GS_REF THEN 'Y' ELSE 'N' END
                 FROM Base b
-                OUTER APPLY (
+                OUTER APPLY
+                (
                     SELECT TOP (1) tb.UUID AS Branch_UUID, tb.Branch_Name
                     FROM dbo.tbl_Branch tb
                     WHERE
-                        (b.Old_Branch_UUID = '1970000043' AND b.EmpLocationDesc = 'Southampton' AND tb.Branch_Name = 'Southampton')
-                        OR
-                        (b.Old_Branch_UUID = '1970000043' AND (b.EmpLocationDesc IS NULL OR b.EmpLocationDesc <> 'Southampton') AND tb.Branch_Name = 'Portsmouth')
-                        OR
-                        (b.Old_Branch_UUID <> '1970000043' AND tb.Old_Branch_UUID = b.Old_Branch_UUID)
+                        (b.Old_Branch_UUID = 1970000043 AND b.EmpLocationDesc = 'Southampton' AND tb.Branch_Name = 'Southampton')
+                     OR (b.Old_Branch_UUID = 1970000043 AND (b.EmpLocationDesc IS NULL OR b.EmpLocationDesc <> 'Southampton') AND tb.Branch_Name = 'Portsmouth')
+                     OR (b.Old_Branch_UUID <> 1970000043 AND tb.Old_Branch_UUID = b.Old_Branch_UUID)
                 ) pick
             ),
-            FinalAgg AS (
+            FinalAgg AS
+            (
                 SELECT
                     s.Employee_UUID,
                     s.Branch_UUID,
                     MIN(s.Start_Date) AS Start_Date,
                     CASE WHEN SUM(CASE WHEN s.End_Date IS NULL THEN 1 ELSE 0 END) > 0
                          THEN NULL ELSE MAX(s.End_Date) END AS End_Date,
-                    MAX(COALESCE(s.[Status],     N'')) AS [Status],
+                    MAX(COALESCE(s.[Status],    N'')) AS [Status],
                     MAX(NULLIF(COALESCE(s.[Group], N''), N'')) AS [Group],
                     MAX(NULLIF(COALESCE(s.Left_Reason, N''), N'')) AS Left_Reason,
                     MAX(NULLIF(COALESCE(s.[Location],   N''), N'')) AS [Location],
-                    MAX(COALESCE(s.Main_Branch,   'N')) AS Main_Branch,  -- 'Y' beats 'N'
-                    MAX(COALESCE(s.Branch_Name,  N'')) AS Branch_Name
+                    MAX(COALESCE(s.Main_Branch, 'N')) AS Main_Branch,
+                    MAX(COALESCE(s.Branch_Name, N'')) AS Branch_Name
                 FROM Shaped s
                 WHERE s.Branch_UUID IS NOT NULL
                   AND s.Start_Date  IS NOT NULL
@@ -462,7 +479,9 @@ BEGIN
             SET @TotalInserted += ISNULL(@i,0);
             SET @TotalUpdated  += ISNULL(@u,0);
 
-            IF @EmitInfo=1 RAISERROR('EmployeeBranch chunk upserted: inserted=%d updated=%d (running %d/%d)', 0,1, @i, @u, @TotalInserted, @TotalUpdated) WITH NOWAIT;
+            IF @EmitInfo=1
+                RAISERROR('EmployeeBranch chunk upserted: inserted=%d updated=%d (running %d/%d)',
+                          0,1,@i,@u,@TotalInserted,@TotalUpdated) WITH NOWAIT;
 
             DELETE c
             FROM #Changed c
@@ -471,7 +490,7 @@ BEGIN
              AND n.Old_Branch_UUID = c.Old_Branch_UUID;
         END
 
-        /* 4) Advance watermark + summary */
+        /* Advance watermark + summary */
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion = @ToVersion,
               LastSyncTime    = SYSUTCDATETIME()
@@ -493,19 +512,26 @@ BEGIN
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
 FinallyRelease:
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+
         RETURN 0;
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
 
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
 
-        IF @EmitInfo=1 RAISERROR('usp_Sync_EmployeeBranch_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',16,1,@num,@sev,@st,@procName,@lin,@msg);
+        IF @EmitInfo=1
+            RAISERROR('usp_Sync_EmployeeBranch_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
+                      16,1,@num,@sev,@st,@procName,@lin,@msg);
+
         SET @Summary = CONCAT(N'EmployeeBranch incremental failed: ', @msg);
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;
     END CATCH
-END
+END;
+GO

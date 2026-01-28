@@ -1,37 +1,11 @@
-/*
-Purpose:
-    Incrementally load new and updated branch records into the staging branches table.
-
-Source:
-    Source branch tables/views (OSD / care system source).
-
-Target:
-    Staging branches table (e.g. dbo.tbl_Branch or equivalent).
-
-Run type:
-    Incremental.
-
-Run frequency:
-    Daily.
-
-Safe to re-run:
-    Usually YES, depending on implementation (MERGE / NOT EXISTS logic).
-
-Notes:
-    - Relies on date or last-modified logic to detect changes.
-    - Must run BEFORE employee, client, and visit incrementals.
-    - Downstream reporting assumes branch metadata is current.
-*/
-
-USE [DOM_LIVE]
+USE [DOM_LIVE];
 GO
-/****** Object:  StoredProcedure [dbo].[usp_Sync_Branch_Incremental]    Script Date: 26/01/2026 20:41:57 ******/
-SET ANSI_NULLS ON
+SET ANSI_NULLS ON;
 GO
-SET QUOTED_IDENTIFIER ON
+SET QUOTED_IDENTIFIER ON;
 GO
 
-ALTER   PROCEDURE [dbo].[usp_Sync_Branch_Incremental]
+ALTER PROCEDURE [dbo].[usp_Sync_Branch_Incremental]
     @ChunkSize      int  = 50000,
     @LockTimeoutMs  int  = 60000,
     @UseAppLock     bit  = 1,
@@ -70,17 +44,26 @@ BEGIN
             SELECT [Summary] = @Summary;
             RETURN @lockResult;
         END;
+
         SET @lockHeld = 1;
     END;
 
     BEGIN TRY
-        -- 1) Preconditions / auto-initial
+        /* 1) Preconditions / auto-initial */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
         BEGIN
             SET @Summary = N'Incremental failed: Change Tracking is not enabled at DB level.';
             SELECT [Summary] = @Summary;
             IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
             RETURN -100;
+        END;
+
+        IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.GLOB_SITE'))
+        BEGIN
+            SET @Summary = N'Incremental failed: CT not enabled on dbo.GLOB_SITE.';
+            SELECT [Summary] = @Summary;
+            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+            RETURN -210;
         END;
 
         DECLARE @NeedsInitial bit = 0;
@@ -116,7 +99,7 @@ BEGIN
             WHERE ProcessName=@Process;
         END
 
-        -- 2) Ensure watermark row and read it
+        /* 2) Ensure watermark row and read it */
         IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
@@ -125,6 +108,7 @@ BEGIN
               LastSyncVersion bigint       NOT NULL,
               LastSyncTime    datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()
             );
+
             INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion) VALUES (@Process, 0);
             SELECT @LastSyncVersion = 0;
         END
@@ -132,6 +116,7 @@ BEGIN
         BEGIN
             IF NOT EXISTS (SELECT 1 FROM dbo.CT_Watermark WHERE ProcessName=@Process)
                 INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion) VALUES (@Process, 0);
+
             SELECT @LastSyncVersion = LastSyncVersion
             FROM dbo.CT_Watermark WITH (UPDLOCK, HOLDLOCK)
             WHERE ProcessName=@Process;
@@ -139,22 +124,18 @@ BEGIN
 
         DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
 
-        -- 3) Detect changed GLOB_SITE rows
+        /* 3) Detect changed GLOB_SITE rows */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed (GS_REF varchar(20) NOT NULL PRIMARY KEY);
+        CREATE TABLE #Changed
+        (
+            Old_Branch_UUID int NOT NULL PRIMARY KEY
+        );
 
-        IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.GLOB_SITE'))
-        BEGIN
-            SET @Summary = N'Incremental failed: CT not enabled on dbo.GLOB_SITE.';
-            SELECT [Summary] = @Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
-            RETURN -210;
-        END;
-
-        INSERT INTO #Changed(GS_REF)
-        SELECT DISTINCT CAST(ct.GS_REF AS varchar(20))
+        INSERT INTO #Changed(Old_Branch_UUID)
+        SELECT DISTINCT TRY_CONVERT(int, ct.GS_REF)
         FROM CHANGETABLE(CHANGES dbo.GLOB_SITE, @LastSyncVersion) ct
-        WHERE ct.SYS_CHANGE_VERSION <= @ToVersion;
+        WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
+          AND TRY_CONVERT(int, ct.GS_REF) IS NOT NULL;
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
         RAISERROR('Branches to process: %d', 0, 1, @ToProcess) WITH NOWAIT;
@@ -180,93 +161,142 @@ BEGIN
             RETURN 0;
         END;
 
-        -- 4) Chunked upsert into tbl_Branch (schema aligned with Initial)
+        /* 4) Chunked upsert into tbl_Branch (MATCHES INITIAL SCHEMA) */
         DECLARE @TotalInserted int=0, @TotalUpdated int=0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next (GS_REF varchar(20) NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next (Old_Branch_UUID int NOT NULL PRIMARY KEY);
 
-            INSERT INTO #Next(GS_REF)
-            SELECT TOP (@ChunkSize) GS_REF FROM #Changed ORDER BY GS_REF;
+            INSERT INTO #Next(Old_Branch_UUID)
+            SELECT TOP (@ChunkSize) Old_Branch_UUID
+            FROM #Changed
+            ORDER BY Old_Branch_UUID;
 
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
             CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
 
             ;WITH Base AS
-(
-    SELECT
-        UUID = LOWER(CONVERT(VARCHAR(40),
-                 HASHBYTES('SHA1',
-                    CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-                         WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                         ELSE LTRIM(RTRIM(gs.NAME))
-                    END
-                 ), 2)),
-        Branch_Name     = CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-                               WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-                               ELSE LTRIM(RTRIM(gs.NAME)) END,
-        Brand           = NULLIF(CAST(LTRIM(RTRIM(gs.VATREG))   AS NVARCHAR(100)), ''),
-        Active          = NULLIF(CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)), ''),
-        Early_Pay_Rate  = NULLIF(TRY_CONVERT(DECIMAL(10,2), ep.LowestBasicRate), 0),
-        Old_Branch_UUID = NULLIF(CAST(LTRIM(RTRIM(gs.GS_REF))   AS VARCHAR(20)), '')
-    FROM dbo.GLOB_SITE gs
-    JOIN #Next n ON n.GS_REF = gs.GS_REF
-    LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep ON ep.Branch = (
-        CASE WHEN gs.GS_REF='1970000043' THEN N'Southampton'
-             WHEN gs.GS_REF='1970000069' THEN N'Old_Southampton'
-             ELSE gs.NAME
-        END
-    )
-)
+            (
+                SELECT
+                    Old_Branch_UUID = TRY_CONVERT(int, gs.GS_REF),
+
+                    Branch_Name =
+                        CASE
+                            WHEN TRY_CONVERT(int, gs.GS_REF) = 1970000043 THEN N'Southampton'
+                            WHEN TRY_CONVERT(int, gs.GS_REF) = 1970000069 THEN N'Old_Southampton'
+                            ELSE LTRIM(RTRIM(gs.NAME))
+                        END,
+
+                    Brand  = NULLIF(CAST(LTRIM(RTRIM(gs.VATREG))   AS NVARCHAR(100)), N''),
+                    Active = NULLIF(CAST(LTRIM(RTRIM(gs.NHS_DEPT)) AS NVARCHAR(20)),  N''),
+
+                    Early_Pay_Rate = NULLIF(TRY_CONVERT(DECIMAL(10,2), ep.LowestBasicRate), 0)
+                FROM dbo.GLOB_SITE gs
+                JOIN #Next n
+                  ON n.Old_Branch_UUID = TRY_CONVERT(int, gs.GS_REF)
+                LEFT JOIN dbo.tbl_EarlyPayInitialRatesTable ep
+                  ON ep.Branch =
+                        CASE
+                            WHEN TRY_CONVERT(int, gs.GS_REF) = 1970000043 THEN N'Southampton'
+                            WHEN TRY_CONVERT(int, gs.GS_REF) = 1970000069 THEN N'Old_Southampton'
+                            ELSE gs.NAME
+                        END
+            ),
+            Expanded AS
+            (
+                SELECT * FROM Base
+
+                UNION ALL
+                SELECT
+                    Old_Branch_UUID = 1970000043,
+                    Branch_Name     = N'Portsmouth',
+                    Brand           = (SELECT TOP (1) Brand          FROM Base WHERE Old_Branch_UUID = 1970000043),
+                    Active          = (SELECT TOP (1) Active         FROM Base WHERE Old_Branch_UUID = 1970000043),
+                    Early_Pay_Rate  = (SELECT TOP (1) Early_Pay_Rate FROM Base WHERE Old_Branch_UUID = 1970000043)
+                WHERE EXISTS (SELECT 1 FROM Base WHERE Old_Branch_UUID = 1970000043)
+            )
             MERGE dbo.tbl_Branch AS tgt
-            USING Base AS src
-               ON tgt.UUID = src.UUID
+            USING
+            (
+                SELECT
+                    Old_Branch_UUID,
+                    Branch_Name,
+                    Brand,
+                    Active,
+                    Early_Pay_Rate
+                FROM Expanded
+                WHERE Old_Branch_UUID IS NOT NULL
+                  AND Branch_Name IS NOT NULL
+            ) AS src
+               ON  tgt.Old_Branch_UUID = src.Old_Branch_UUID
+               AND tgt.Branch_Name     = src.Branch_Name
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.Branch_Name     = src.Branch_Name,
-                    tgt.Brand           = src.Brand,
-                    tgt.Active          = src.Active,
-                    tgt.Early_Pay_Rate  = src.Early_Pay_Rate,
-                    tgt.Old_Branch_UUID = src.Old_Branch_UUID,
-                    tgt.UpdatedAtUTC    = @RunStartedAt
+                    tgt.Brand          = src.Brand,
+                    tgt.Active         = src.Active,
+                    tgt.Early_Pay_Rate = src.Early_Pay_Rate,
+                    tgt.UpdatedAtUTC   = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
-                INSERT (UUID, Branch_Name, Brand, Active, Early_Pay_Rate, Old_Branch_UUID, CreatedAtUTC, UpdatedAtUTC)
-                VALUES (src.UUID, src.Branch_Name, src.Brand, src.Active, src.Early_Pay_Rate, src.Old_Branch_UUID, @RunStartedAt, @RunStartedAt)
+                INSERT
+                (
+                    Old_Branch_UUID,
+                    Branch_Name,
+                    Brand,
+                    Active,
+                    Early_Pay_Rate,
+                    CreatedAtUTC,
+                    UpdatedAtUTC
+                )
+                VALUES
+                (
+                    src.Old_Branch_UUID,
+                    src.Branch_Name,
+                    src.Brand,
+                    src.Active,
+                    src.Early_Pay_Rate,
+                    @RunStartedAt,
+                    @RunStartedAt
+                )
             OUTPUT $action INTO #ActLog(Action);
 
             DECLARE @i int=0,@u int=0;
-            SELECT @i=SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
-                   @u=SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END)
+            SELECT
+                @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
+                @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END)
             FROM #ActLog;
 
-            SET @TotalInserted+=ISNULL(@i,0);
-            SET @TotalUpdated+=ISNULL(@u,0);
+            SET @TotalInserted += ISNULL(@i,0);
+            SET @TotalUpdated  += ISNULL(@u,0);
 
             DELETE c
             FROM #Changed c
-            JOIN #Next n ON n.GS_REF = c.GS_REF;
+            JOIN #Next n ON n.Old_Branch_UUID = c.Old_Branch_UUID;
         END;
 
-        -- 5) Deletions (rows deleted in GLOB_SITE since last sync)
+        /* 5) Deletions (rows deleted in GLOB_SITE since last sync) */
         DECLARE @TotalDeleted int=0;
+
         IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
-        CREATE TABLE #DelLog(UUID varchar(42) NOT NULL);
+        CREATE TABLE #DelLog(UUID int NOT NULL);
 
         DELETE t
         OUTPUT DELETED.UUID INTO #DelLog(UUID)
         FROM dbo.tbl_Branch t
-        JOIN (
-            SELECT CAST(LTRIM(RTRIM(d.GS_REF)) AS VARCHAR(20)) AS GS_REF
+        JOIN
+        (
+            SELECT TRY_CONVERT(int, d.GS_REF) AS Old_Branch_UUID
             FROM CHANGETABLE(CHANGES dbo.GLOB_SITE, @LastSyncVersion) d
             WHERE d.SYS_CHANGE_OPERATION='D'
               AND d.SYS_CHANGE_VERSION<=@ToVersion
-        ) x ON t.Old_Branch_UUID = x.GS_REF;
+              AND TRY_CONVERT(int, d.GS_REF) IS NOT NULL
+        ) x
+          ON t.Old_Branch_UUID = x.Old_Branch_UUID;
 
         SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
 
-        -- 6) Advance watermark + summary
+        /* 6) Advance watermark + summary */
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
         WHERE ProcessName=@Process;
@@ -290,10 +320,13 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+
         DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
         SET @Summary = CONCAT(N'usp_Sync_Branch_Incremental failed: ', @msg);
         SELECT [Summary] = @Summary;
+
         RAISERROR('usp_Sync_Branch_Incremental failed: %s',16,1,@msg);
         RETURN -50001;
     END CATCH;
 END;
+GO
