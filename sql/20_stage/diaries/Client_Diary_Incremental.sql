@@ -285,11 +285,16 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             ;WITH Base AS
             (
                 SELECT
-                    Client_UUID                = cdy.CLIENT_REF,
-                    UUID                        = cdy.CL_DY_REF,
+                    Client_UUID                = CAST(cdy.CLIENT_REF AS varchar(20)),
+                    UUID                       = CAST(cdy.CL_DY_REF  AS varchar(20)),
                     Client_Diary_Entry_Date     = cdy.ENTRY_DATE,
                     Client_Diary_Entry_Type     = LTRIM(RTRIM(cet.DESCRIPTION)),
-                    Client_Diary_Entry_Text     = cdy.ENTRY_TEXT
+                    Client_Diary_Entry_Text     = cdy.ENTRY_TEXT,
+                    Client_Diary_Review_Date    = cdy.REVIEW_DATE,
+                    Client_Diary_Action         = CASE WHEN cdy.ACTION = 'Y' THEN 1 ELSE 0 END,
+                    Client_Diary_Action_Date    = cdy.ACTIONDT,
+                    Client_Diary_Done_Date      = cdy.REVDONE_DT,
+                    Client_Diary_Reminded       = CASE WHEN cdy.REMINDED = 'Y' THEN 1 ELSE 0 END
                 FROM dbo.CLIENT_DY cdy
                 JOIN #Next n
                   ON n.ClientRef = cdy.CLIENT_REF
@@ -306,21 +311,30 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
               AND tgt.UUID        = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.Client_Diary_Entry_Date = src.Client_Diary_Entry_Date,
-                    tgt.Client_Diary_Entry_Type = src.Client_Diary_Entry_Type,
-                    tgt.Client_Diary_Entry_Text = src.Client_Diary_Entry_Text,
-                    tgt.UpdatedAtUTC            = @RunStartedAt
+                    tgt.Client_Diary_Entry_Date   = src.Client_Diary_Entry_Date,
+                    tgt.Client_Diary_Entry_Type   = src.Client_Diary_Entry_Type,
+                    tgt.Client_Diary_Entry_Text   = src.Client_Diary_Entry_Text,
+                    tgt.Client_Diary_Review_Date  = src.Client_Diary_Review_Date,
+                    tgt.Client_Diary_Action       = src.Client_Diary_Action,
+                    tgt.Client_Diary_Action_Date  = src.Client_Diary_Action_Date,
+                    tgt.Client_Diary_Done_Date    = src.Client_Diary_Done_Date,
+                    tgt.Client_Diary_Reminded     = src.Client_Diary_Reminded,
+                    tgt.UpdatedAtUTC              = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT
                 (
                     Client_UUID, UUID,
                     Client_Diary_Entry_Date, Client_Diary_Entry_Type, Client_Diary_Entry_Text,
+                    Client_Diary_Review_Date, Client_Diary_Action, Client_Diary_Action_Date,
+                    Client_Diary_Done_Date, Client_Diary_Reminded,
                     CreatedAtUTC, UpdatedAtUTC
                 )
                 VALUES
                 (
                     src.Client_UUID, src.UUID,
                     src.Client_Diary_Entry_Date, src.Client_Diary_Entry_Type, src.Client_Diary_Entry_Text,
+                    src.Client_Diary_Review_Date, src.Client_Diary_Action, src.Client_Diary_Action_Date,
+                    src.Client_Diary_Done_Date, src.Client_Diary_Reminded,
                     @RunStartedAt, @RunStartedAt
                 )
             WHEN NOT MATCHED BY SOURCE
@@ -328,8 +342,8 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
                  (
                      SELECT 1
                      FROM #Next nn
-                     WHERE nn.ClientRef = tgt.Client_UUID
-                       AND nn.DiaryRef  = tgt.UUID
+                     WHERE CAST(nn.ClientRef AS varchar(20)) = tgt.Client_UUID
+                       AND CAST(nn.DiaryRef  AS varchar(20)) = tgt.UUID
                  )
                  THEN DELETE
             OUTPUT $action INTO #ActLog(Action);
@@ -360,12 +374,12 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
         IF EXISTS (SELECT 1 FROM #ClientsToPurge)
         BEGIN
             IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
-            CREATE TABLE #DelLog (ClientRef INT NOT NULL);
+            CREATE TABLE #DelLog (ClientRef varchar(20) NOT NULL);
 
             DELETE tgt
             OUTPUT DELETED.Client_UUID INTO #DelLog(ClientRef)
             FROM dbo.tbl_ClientDiary tgt
-            JOIN #ClientsToPurge p ON p.ClientRef = tgt.Client_UUID;
+            JOIN #ClientsToPurge p ON CAST(p.ClientRef AS varchar(20)) = tgt.Client_UUID;
 
             DECLARE @Purged int = (SELECT COUNT(*) FROM #DelLog);
             SET @TotalDeleted += @Purged;
