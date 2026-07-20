@@ -27,7 +27,8 @@ CREATE OR ALTER PROCEDURE dbo.usp_Purge_Visits_Expired
     @UseAppLock      bit            = 1,
     @EmitInfo        bit            = 1,
     @Summary         nvarchar(4000) = NULL OUTPUT,
-    @ReturnSummaryRow bit           = 1
+    @ReturnSummaryRow bit           = 1,
+    @PreviewOnly     bit            = 0
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -40,6 +41,7 @@ BEGIN
     DECLARE @CutoffText   varchar(33);
     DECLARE @BatchDeleted int;
     DECLARE @TotalDeleted bigint = 0;
+    DECLARE @CandidateRows bigint = 0;
     DECLARE @BatchNo      int = 0;
     DECLARE @LockHeld     bit = 0;
     DECLARE @LockResult   int;
@@ -78,6 +80,33 @@ BEGIN
         /* Check after the lock so an initial Visits rebuild cannot race this check. */
         IF OBJECT_ID(N'dbo.tbl_Visits', N'U') IS NULL
             THROW 50013, 'Visits purge: dbo.tbl_Visits does not exist.', 1;
+
+        IF @PreviewOnly = 1
+        BEGIN
+            SELECT @CandidateRows = COUNT_BIG(*)
+            FROM dbo.tbl_Visits
+            WHERE Actual_Visit_Start_Date_Time < @CutoffUTC;
+
+            SET @Summary = CONCAT(
+                N'Visits purge preview; ', CAST(@CandidateRows AS nvarchar(30)),
+                N' rows are older than ', @CutoffText, N' UTC. No rows deleted.'
+            );
+
+            IF @ReturnSummaryRow = 1
+                SELECT
+                    N'Preview' AS Stage,
+                    @CutoffUTC AS CutoffUTC,
+                    @CandidateRows AS CandidateRows,
+                    @Summary AS Summary;
+
+            IF @LockHeld = 1
+                EXEC sys.sp_releaseapplock
+                    @Resource = @LockResource,
+                    @LockOwner = @LockOwner,
+                    @DbPrincipal = @DbPrincipal;
+
+            RETURN 0;
+        END;
 
         IF @EmitInfo = 1
             RAISERROR('Visits purge started. Cutoff UTC=%s, batch size=%d',
