@@ -11,7 +11,8 @@ CREATE OR ALTER PROCEDURE dbo.usp_Sync_Visits_Incremental
     @UseAppLock       bit            = 1,
     @EmitInfo         bit            = 1,
     @Summary          nvarchar(4000) = NULL OUTPUT,
-    @ReturnSummaryRow bit            = 1
+    @ReturnSummaryRow bit            = 1,
+    @PurgeOldVisits   bit            = 0
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -31,6 +32,10 @@ BEGIN
         IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -10;
     END
+
+    /* Retention is normally handled by dbo.usp_Purge_Visits_Expired. */
+    IF @PurgeOldVisits IS NULL
+        SET @PurgeOldVisits = 0;
 
     DECLARE @ScopeStart datetime2(3) = DATEADD(YEAR, -3, SYSUTCDATETIME());
 
@@ -307,12 +312,31 @@ BEGIN
 
         SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
 
-        /* 6) Scope purge (optional) */
-        DELETE v
-        FROM dbo.tbl_Visits v
-        WHERE v.Actual_Visit_Start_Date_Time < @ScopeStart;
+        /* 6) Optional scope purge. Prefer the dedicated purge job. */
+        IF @PurgeOldVisits = 1
+        BEGIN
+            /*
+               Keep any opt-in retention purge in small autocommit batches.
+               The normal daily runner leaves @PurgeOldVisits at 0 and uses
+               dbo.usp_Purge_Visits_Expired on its own schedule.
+            */
+            DECLARE @PurgeBatchDeleted int = 1;
+            DECLARE @PurgeBatchSize    int = 10000;
 
-        SET @TotalAgedOut = @@ROWCOUNT;
+            WHILE @PurgeBatchDeleted > 0
+            BEGIN
+                DELETE TOP (@PurgeBatchSize)
+                FROM dbo.tbl_Visits
+                WHERE Actual_Visit_Start_Date_Time < @ScopeStart;
+
+                SET @PurgeBatchDeleted = @@ROWCOUNT;
+                SET @TotalAgedOut += @PurgeBatchDeleted;
+
+                IF @EmitInfo = 1 AND @PurgeBatchDeleted > 0
+                    RAISERROR('Visits age purge batch: deleted=%d (running total=%I64d)',
+                              0, 1, @PurgeBatchDeleted, @TotalAgedOut) WITH NOWAIT;
+            END;
+        END;
 
         /* 7) Watermark + summary */
         UPDATE dbo.CT_Watermark

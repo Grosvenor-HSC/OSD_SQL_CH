@@ -23,12 +23,12 @@ DECLARE @FailFast bit = 1;   -- 1 = missing proc stops run, 0 = missing proc is 
 
 /* Optional tuning defaults (only used if the proc supports these params) */
 DECLARE @DefaultChunkSize int = 100000;
-DECLARE @DefaultEmit bit = 1;
+DECLARE @DefaultEmit bit = 0;    -- scheduled runs are quiet by default
 DECLARE @DefaultLockTimeoutMs int = 600000;
 
 /* Visits tuning (optional) */
 DECLARE @VisitsChunkSize int = 200000;
-DECLARE @VisitsEmit bit = 1;
+DECLARE @VisitsEmit bit = 0;     -- scheduled runs are quiet by default
 
 DECLARE @StartedAt datetime2(3) = SYSUTCDATETIME();
 DECLARE @EndedAt   datetime2(3);
@@ -49,6 +49,10 @@ VALUES
 (N'Employees Incremental',            N'dbo', N'usp_Sync_Employees_Incremental'),
 (N'Clients Incremental',              N'dbo', N'usp_Sync_Clients_Incremental'),
 (N'Visits Incremental',               N'dbo', N'usp_Sync_Visits_Incremental'),
+
+(N'EmployeeBranch Incremental',       N'dbo', N'usp_Sync_EmployeeBranch_Incremental'),
+(N'EmployeeSkills Incremental',       N'dbo', N'usp_Sync_EmployeeSkills_Incremental'),
+(N'EmployeeStartLeaveDates Incremental', N'dbo', N'usp_Sync_EmployeeStartLeaveDates_Incremental'),
 
 /* Optional (only include if you have these as procs) */
 (N'ClientDiary Incremental',          N'dbo', N'usp_Sync_ClientDiary_Incremental'),

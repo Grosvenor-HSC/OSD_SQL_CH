@@ -17,6 +17,9 @@ Key behavior:
 How to run:
   - SQL Agent job step: Transact-SQL script (T-SQL)
   - No SQLCMD mode required
+  - When run manually, the configured daily SQL Agent job is disabled before
+    the initial load and re-enabled only after a successful completion.
+  - Do not run this script as a step inside the daily job itself.
 
 SQL Server:
   - Compatible with SQL Server 2016 SP3 (13.x)
@@ -29,6 +32,11 @@ SET XACT_ABORT ON;
 
 DECLARE @FailFast bit = 1;   -- 1 = missing proc stops run, 0 = missing proc is logged + skipped
 
+/* Daily-job protection during the destructive initial load */
+DECLARE @DailyJobName sysname = N'update new db';
+DECLARE @ProtectDailyJob bit = 1;
+DECLARE @ReEnableDailyJobOnSuccess bit = 0; -- manually re-enable after validation
+
 /* Visits tuning (Option A) */
 DECLARE @VisitsChunkSize int = 100000;  -- e.g. 5000 (more chatter) / 100000 (reasonable) / 1000000 (quiet)
 DECLARE @VisitsEmitProgress bit = 1;    -- 1 = progress on, 0 = off
@@ -36,6 +44,10 @@ DECLARE @VisitsEmitProgress bit = 1;    -- 1 = progress on, 0 = off
 DECLARE @StartedAt datetime2(3) = SYSUTCDATETIME();
 DECLARE @EndedAt   datetime2(3);
 DECLARE @Msg       nvarchar(2047);
+
+DECLARE @DailyJobId uniqueidentifier = NULL;
+DECLARE @DailyJobWasEnabled bit = 0;
+DECLARE @AgentSessionId int = NULL;
 
 SET @Msg = N'============================================================';
 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -92,6 +104,68 @@ DECLARE
     @DurSec      int;
 
 BEGIN TRY
+    /*
+       Prevent the scheduled incremental refresh from running against tables
+       that the initial procedures drop and recreate.  Disable first so a new
+       schedule tick cannot start while the current run is being stopped.
+    */
+    IF @ProtectDailyJob = 1
+    BEGIN
+        IF APP_NAME() LIKE N'SQLAgent - TSQL JobStep%'
+            THROW 50001, 'run_initial.sql must be started manually, not from a SQL Agent job step.', 1;
+
+        SELECT
+            @DailyJobId = job_id,
+            @DailyJobWasEnabled = CONVERT(bit, enabled)
+        FROM msdb.dbo.sysjobs
+        WHERE name = @DailyJobName;
+
+        IF @DailyJobId IS NULL
+            THROW 50002, 'Configured daily SQL Agent job was not found.', 1;
+
+        EXEC msdb.dbo.sp_update_job
+            @job_id = @DailyJobId,
+            @enabled = 0;
+
+        SELECT @AgentSessionId = MAX(session_id)
+        FROM msdb.dbo.syssessions;
+
+        IF EXISTS
+        (
+            SELECT 1
+            FROM msdb.dbo.sysjobactivity ja
+            WHERE ja.session_id = @AgentSessionId
+              AND ja.job_id = @DailyJobId
+              AND ja.start_execution_date IS NOT NULL
+              AND ja.stop_execution_date IS NULL
+        )
+        BEGIN
+            RAISERROR('Stopping and waiting for daily job: %s', 10, 1, @DailyJobName) WITH NOWAIT;
+
+            EXEC msdb.dbo.sp_stop_job @job_id = @DailyJobId;
+
+            DECLARE @StopWaitStartedAt datetime2(3) = SYSUTCDATETIME();
+
+            WHILE EXISTS
+            (
+                SELECT 1
+                FROM msdb.dbo.sysjobactivity ja
+                WHERE ja.session_id = @AgentSessionId
+                  AND ja.job_id = @DailyJobId
+                  AND ja.start_execution_date IS NOT NULL
+                  AND ja.stop_execution_date IS NULL
+            )
+            BEGIN
+                IF DATEDIFF(SECOND, @StopWaitStartedAt, SYSUTCDATETIME()) >= 120
+                    THROW 50003, 'Daily SQL Agent job did not stop within 120 seconds; it remains disabled.', 1;
+
+                WAITFOR DELAY '00:00:01';
+            END;
+        END;
+
+        RAISERROR('Daily job disabled for initial load: %s', 10, 1, @DailyJobName) WITH NOWAIT;
+    END;
+
     WHILE @i <= @n
     BEGIN
         SELECT
@@ -224,6 +298,18 @@ BEGIN TRY
 
     SET @EndedAt = SYSUTCDATETIME();
 
+    IF @ProtectDailyJob = 1
+       AND @ReEnableDailyJobOnSuccess = 1
+       AND @DailyJobWasEnabled = 1
+       AND @DailyJobId IS NOT NULL
+    BEGIN
+        EXEC msdb.dbo.sp_update_job
+            @job_id = @DailyJobId,
+            @enabled = 1;
+
+        RAISERROR('Daily job re-enabled after successful initial load: %s', 10, 1, @DailyJobName) WITH NOWAIT;
+    END;
+
     SET @Msg = N'============================================================';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
@@ -252,6 +338,12 @@ BEGIN CATCH
 
     SET @Msg = N'RUN_INITIAL FAILED';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+    IF @ProtectDailyJob = 1 AND @DailyJobId IS NOT NULL
+    BEGIN
+        SET @Msg = N'Daily job remains disabled after initial-load failure: ' + @DailyJobName;
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    END;
 
     SET @Msg = N'Error: ' + ISNULL(@Em2, N'(null)');
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
