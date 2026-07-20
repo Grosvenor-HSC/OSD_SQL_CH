@@ -148,6 +148,8 @@ BEGIN
             SET @Summary = CONCAT(N'Employees incremental failed: watermark ', @LastSyncVersion,
                                  N' < min valid ', @MinValid, N' (re-baseline required).');
             IF @ReturnSummaryRow = 1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+            IF @lockHeld = 1
+                EXEC sys.sp_releaseapplock @Resource = @LockResource, @LockOwner = @LockOwner, @DbPrincipal = @DbPrincipal;
             RETURN -200;
         END
 
@@ -252,6 +254,8 @@ BEGIN
 
             IF @EmitInfo = 1 RAISERROR('No changes. Watermark advanced.', 0, 1) WITH NOWAIT;
             IF @ReturnSummaryRow = 1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+            IF @lockHeld = 1
+                EXEC sys.sp_releaseapplock @Resource = @LockResource, @LockOwner = @LockOwner, @DbPrincipal = @DbPrincipal;
             RETURN 0;
         END
 
@@ -443,18 +447,22 @@ BEGIN
         IF @EmitInfo = 1 RAISERROR('Employees incremental sync complete.', 0, 1) WITH NOWAIT;
         IF @ReturnSummaryRow = 1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
+        IF @lockHeld = 1
+            EXEC sys.sp_releaseapplock @Resource = @LockResource, @LockOwner = @LockOwner, @DbPrincipal = @DbPrincipal;
+
         RETURN 0;
     END TRY
     BEGIN CATCH
         DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
         DECLARE @num int = ERROR_NUMBER(), @sev int = ERROR_SEVERITY(), @st int = ERROR_STATE(),
                 @lin int = ERROR_LINE(), @proc sysname = ERROR_PROCEDURE();
+        DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
 
         SET @Summary = CONCAT(N'Employees incremental failed: ', @msg);
 
         IF @EmitInfo = 1
             RAISERROR('usp_Sync_Employees_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
-                      16, 1, @num, @sev, @st, ISNULL(@proc, N'<adhoc>'), @lin, @msg);
+                      16, 1, @num, @sev, @st, @procName, @lin, @msg);
 
         IF @ReturnSummaryRow = 1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
@@ -464,10 +472,5 @@ BEGIN
         RETURN -50001;
     END CATCH
 
-    -------------------------------------------------------------------------
-    -- Always release applock on success too
-    -------------------------------------------------------------------------
-    IF @lockHeld = 1
-        EXEC sys.sp_releaseapplock @Resource = @LockResource, @LockOwner = @LockOwner, @DbPrincipal = @DbPrincipal;
 END
 GO
