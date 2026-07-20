@@ -38,7 +38,7 @@ DECLARE @ProtectDailyJob bit = 1;
 DECLARE @ReEnableDailyJobOnSuccess bit = 0; -- manually re-enable after validation
 
 /* Visits tuning (Option A) */
-DECLARE @VisitsChunkSize int = 100000;  -- e.g. 5000 (more chatter) / 100000 (reasonable) / 1000000 (quiet)
+DECLARE @VisitsChunkSize int = 250000;  -- e.g. 5000 (more chatter) / 100000 (reasonable) / 1000000 (quiet)
 DECLARE @VisitsEmitProgress bit = 1;    -- 1 = progress on, 0 = off
 
 DECLARE @StartedAt datetime2(3) = SYSUTCDATETIME();
