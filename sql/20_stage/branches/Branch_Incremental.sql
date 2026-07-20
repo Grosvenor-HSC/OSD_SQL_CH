@@ -5,16 +5,34 @@ GO
 SET QUOTED_IDENTIFIER ON;
 GO
 
+/* ============================================================
+   File: Branch_Incremental.sql
+   Proc: dbo.usp_Sync_Branch_Incremental
+
+   Refactor goals (match NEW Branch_Initial):
+     - Same CT fencing + watermark discipline
+     - Same mapping logic + Portsmouth synthetic row
+     - Consistent applock pattern + clean release
+     - Optional auto-initial (off by default)
+     - Chunked, deterministic upsert + explicit delete pass
+     - SQL 2016-safe streaming messages via RAISERROR(...,10,1) WITH NOWAIT
+     - Single Summary output and single-row result (SELECT [Summary]=@Summary)
+     - No variable name collisions (case-insensitive)
+   ============================================================ */
+
 ALTER PROCEDURE [dbo].[usp_Sync_Branch_Incremental]
     @ChunkSize      int  = 50000,
     @LockTimeoutMs  int  = 60000,
     @UseAppLock     bit  = 1,
+    @EmitProgress   bit  = 0,
+    @AutoInitial    bit  = 0, -- 0=fail if baseline missing/stale, 1=run Initial automatically
     @Summary        nvarchar(4000) = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
+    /* ---------- Run context ---------- */
     DECLARE @Process        sysname      = N'Branch';
     DECLARE @RunStartedAt   datetime2(3) = SYSUTCDATETIME();
     DECLARE @StartIso       varchar(33)  = CONVERT(varchar(33), @RunStartedAt, 126);
@@ -22,12 +40,14 @@ BEGIN
     DECLARE @EndIso         varchar(33);
     DECLARE @DurationSec    int;
 
-    -- 0) Concurrency guard
+    DECLARE @Msg            nvarchar(2047);
+
+    /* ---------- Concurrency ---------- */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:Branch';
-    DECLARE @LockOwner   sysname = N'Session';
-    DECLARE @DbPrincipal sysname = N'dbo';
-    DECLARE @lockResult  int;
-    DECLARE @lockHeld    bit = 0;
+    DECLARE @LockOwner    sysname = N'Session';
+    DECLARE @DbPrincipal  sysname = N'dbo';
+    DECLARE @lockResult   int;
+    DECLARE @lockHeld     bit = 0;
 
     IF @UseAppLock = 1
     BEGIN
@@ -40,96 +60,105 @@ BEGIN
 
         IF @lockResult NOT IN (0,1)
         BEGIN
-            SET @Summary = N'Incremental failed: could not acquire applock.';
+            SET @Summary = N'Branch incremental failed: could not acquire applock.';
             SELECT [Summary] = @Summary;
-            RETURN @lockResult;
+            RETURN -1;
         END;
 
         SET @lockHeld = 1;
     END;
 
     BEGIN TRY
-        /* 1) Preconditions / auto-initial */
+        /* ============================================================
+           1) Preconditions
+           ============================================================ */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
-        BEGIN
-            SET @Summary = N'Incremental failed: Change Tracking is not enabled at DB level.';
-            SELECT [Summary] = @Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
-            RETURN -100;
-        END;
+            RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.GLOB_SITE'))
+            RAISERROR('Change Tracking is not enabled on dbo.GLOB_SITE.', 16, 1);
+
+        /* ============================================================
+           2) Ensure baseline exists (or auto-run Initial)
+           ============================================================ */
+        DECLARE @NeedInitial bit = 0;
+
+        IF OBJECT_ID(N'dbo.tbl_Branch', N'U') IS NULL
+            SET @NeedInitial = 1;
+
+        IF @NeedInitial = 0
         BEGIN
-            SET @Summary = N'Incremental failed: CT not enabled on dbo.GLOB_SITE.';
-            SELECT [Summary] = @Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
-            RETURN -210;
-        END;
+            IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
+                SET @NeedInitial = 1;
+            ELSE IF NOT EXISTS (SELECT 1 FROM dbo.CT_Watermark WHERE ProcessName = @Process)
+                SET @NeedInitial = 1;
+        END
 
-        DECLARE @NeedsInitial bit = 0;
-        DECLARE @LastSyncVersion bigint = NULL;
-
-        IF OBJECT_ID('dbo.tbl_Branch','U') IS NULL SET @NeedsInitial = 1;
-
-        IF @NeedsInitial = 0
+        IF @NeedInitial = 1
         BEGIN
-            IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
-                SET @NeedsInitial = 1;
-            ELSE IF NOT EXISTS (SELECT 1 FROM dbo.CT_Watermark WHERE ProcessName=@Process)
-                SET @NeedsInitial = 1;
+            IF @AutoInitial = 1 AND OBJECT_ID(N'dbo.usp_Sync_Branch_Initial', N'P') IS NOT NULL
+            BEGIN
+                IF @EmitProgress=1
+                    RAISERROR(N'Auto-running Branch initial (table/watermark missing).', 10, 1) WITH NOWAIT;
+
+                EXEC dbo.usp_Sync_Branch_Initial;
+            END
             ELSE
             BEGIN
-                SELECT @LastSyncVersion = LastSyncVersion
-                FROM dbo.CT_Watermark WITH (UPDLOCK, HOLDLOCK)
-                WHERE ProcessName=@Process;
-
-                DECLARE @MinValid bigint = CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'dbo.GLOB_SITE'));
-                IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
-                    SET @NeedsInitial = 1;
+                RAISERROR('Branch baseline missing. Run dbo.usp_Sync_Branch_Initial first (or set @AutoInitial=1).', 16, 1);
             END
         END
 
-        IF @NeedsInitial = 1
-        BEGIN
-            RAISERROR('Auto-running Branch initial (table/watermark missing or stale).',0,1) WITH NOWAIT;
-            EXEC dbo.usp_Sync_Branch_Initial;
+        /* ============================================================
+           3) Read watermark and validate CT retention
+           ============================================================ */
+        IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
+            RAISERROR('CT_Watermark missing. Run Branch initial first.', 16, 1);
 
-            SELECT @LastSyncVersion = LastSyncVersion
-            FROM dbo.CT_Watermark
-            WHERE ProcessName=@Process;
+        IF NOT EXISTS (SELECT 1 FROM dbo.CT_Watermark WHERE ProcessName=@Process)
+            RAISERROR('CT watermark row missing for Branch. Run Branch initial first.', 16, 1);
+
+        DECLARE @LastSyncVersion bigint;
+
+        SELECT @LastSyncVersion = LastSyncVersion
+        FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK)
+        WHERE ProcessName = @Process;
+
+        DECLARE @MinValid bigint = CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'dbo.GLOB_SITE'));
+
+        IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
+        BEGIN
+            IF @AutoInitial = 1 AND OBJECT_ID(N'dbo.usp_Sync_Branch_Initial', N'P') IS NOT NULL
+            BEGIN
+                IF @EmitProgress=1
+                    RAISERROR(N'Auto-running Branch initial (watermark stale vs CT min valid).', 10, 1) WITH NOWAIT;
+
+                EXEC dbo.usp_Sync_Branch_Initial;
+
+                SELECT @LastSyncVersion = LastSyncVersion
+                FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK)
+                WHERE ProcessName = @Process;
+            END
+            ELSE
+            BEGIN
+                RAISERROR('Branch watermark (%I64d) < CT min valid (%I64d). Re-baseline required.', 16, 1, @LastSyncVersion, @MinValid);
+            END
         END
 
-        /* 2) Ensure watermark row and read it */
-        IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
-        BEGIN
-            CREATE TABLE dbo.CT_Watermark
-            (
-              ProcessName     sysname      PRIMARY KEY,
-              LastSyncVersion bigint       NOT NULL,
-              LastSyncTime    datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()
-            );
-
-            INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion) VALUES (@Process, 0);
-            SELECT @LastSyncVersion = 0;
-        END
-        ELSE IF @LastSyncVersion IS NULL
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM dbo.CT_Watermark WHERE ProcessName=@Process)
-                INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion) VALUES (@Process, 0);
-
-            SELECT @LastSyncVersion = LastSyncVersion
-            FROM dbo.CT_Watermark WITH (UPDLOCK, HOLDLOCK)
-            WHERE ProcessName=@Process;
-        END
-
+        /* Fence CT window at START */
         DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
 
-        /* 3) Detect changed GLOB_SITE rows */
+        IF @EmitProgress=1
+        BEGIN
+            SET @Msg = CONCAT(N'Branch CT window: From=', @LastSyncVersion, N' To=', @ToVersion);
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+
+        /* ============================================================
+           4) Detect changed keys (GS_REF -> Old_Branch_UUID)
+           ============================================================ */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed
-        (
-            Old_Branch_UUID int NOT NULL PRIMARY KEY
-        );
+        CREATE TABLE #Changed (Old_Branch_UUID int NOT NULL PRIMARY KEY);
 
         INSERT INTO #Changed(Old_Branch_UUID)
         SELECT DISTINCT TRY_CONVERT(int, ct.GS_REF)
@@ -138,8 +167,16 @@ BEGIN
           AND TRY_CONVERT(int, ct.GS_REF) IS NOT NULL;
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
-        RAISERROR('Branches to process: %d', 0, 1, @ToProcess) WITH NOWAIT;
 
+        IF @EmitProgress=1
+        BEGIN
+            SET @Msg = CONCAT(N'Branches to process: ', @ToProcess);
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+
+        /* ============================================================
+           5) No-op fast path
+           ============================================================ */
         IF @ToProcess = 0
         BEGIN
             UPDATE dbo.CT_Watermark
@@ -155,14 +192,20 @@ BEGIN
                 N' UTC; inserted 0, updated 0, deleted 0; advanced watermark to ',
                 CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
             );
+
             SELECT [Summary] = @Summary;
 
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
-            RETURN 0;
-        END;
+            IF @lockHeld=1
+                EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
 
-        /* 4) Chunked upsert into tbl_Branch (MATCHES INITIAL SCHEMA) */
-        DECLARE @TotalInserted int=0, @TotalUpdated int=0;
+            RETURN 0;
+        END
+
+        /* ============================================================
+           6) Chunked MERGE upsert (same mapping as Initial)
+           ============================================================ */
+        DECLARE @TotalInserted int = 0;
+        DECLARE @TotalUpdated  int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
@@ -175,7 +218,7 @@ BEGIN
             ORDER BY Old_Branch_UUID;
 
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
-            CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
+            CREATE TABLE #ActLog (MergeAction nvarchar(10) NOT NULL);
 
             ;WITH Base AS
             (
@@ -259,24 +302,37 @@ BEGIN
                     @RunStartedAt,
                     @RunStartedAt
                 )
-            OUTPUT $action INTO #ActLog(Action);
+            OUTPUT $action AS MergeAction INTO #ActLog(MergeAction);
 
-            DECLARE @i int=0,@u int=0;
+            DECLARE @i int=0, @u int=0;
             SELECT
-                @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
-                @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END)
+                @i = SUM(CASE WHEN MergeAction='INSERT' THEN 1 ELSE 0 END),
+                @u = SUM(CASE WHEN MergeAction='UPDATE' THEN 1 ELSE 0 END)
             FROM #ActLog;
 
             SET @TotalInserted += ISNULL(@i,0);
             SET @TotalUpdated  += ISNULL(@u,0);
 
+            IF @EmitProgress=1
+            BEGIN
+                SET @Msg = CONCAT(
+                    N'Branch chunk: inserted=', @i,
+                    N' updated=', @u,
+                    N' (running ', @TotalInserted, N'/', @TotalUpdated, N')'
+                );
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+
             DELETE c
             FROM #Changed c
             JOIN #Next n ON n.Old_Branch_UUID = c.Old_Branch_UUID;
-        END;
+        END
 
-        /* 5) Deletions (rows deleted in GLOB_SITE since last sync) */
-        DECLARE @TotalDeleted int=0;
+        /* ============================================================
+           7) Deletions (rows deleted in GLOB_SITE since last sync)
+              - This may delete multiple target rows per GS_REF (e.g. Portsmouth+Southampton)
+           ============================================================ */
+        DECLARE @DeletedThisRun int = 0;
 
         IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
         CREATE TABLE #DelLog(UUID int NOT NULL);
@@ -294,14 +350,14 @@ BEGIN
         ) x
           ON t.Old_Branch_UUID = x.Old_Branch_UUID;
 
-        SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
+        SET @DeletedThisRun = (SELECT COUNT(*) FROM #DelLog);
 
-        /* 6) Advance watermark + summary */
+        /* ============================================================
+           8) Advance watermark + summary
+           ============================================================ */
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
         WHERE ProcessName=@Process;
-
-        RAISERROR('Branch sync complete. Inserted=%d Updated=%d Deleted=%d',0,1,@TotalInserted,@TotalUpdated,@TotalDeleted) WITH NOWAIT;
 
         SET @EndUTC = SYSUTCDATETIME();
         SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
@@ -310,23 +366,27 @@ BEGIN
         SET @Summary = CONCAT(
             N'Branch incremental started ', @StartIso, N' UTC; ended ', @EndIso,
             N' UTC; inserted ', @TotalInserted, N', updated ', @TotalUpdated,
-            N', deleted ', @TotalDeleted, N'; advanced watermark to ',
+            N', deleted ', @DeletedThisRun, N'; advanced watermark to ',
             CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
         );
+
         SELECT [Summary] = @Summary;
 
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+
         RETURN 0;
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+        IF @lockHeld=1
+            EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
 
-        DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
-        SET @Summary = CONCAT(N'usp_Sync_Branch_Incremental failed: ', @msg);
+        DECLARE @ErrMsg nvarchar(4000) = ERROR_MESSAGE();
+
+        SET @Summary = CONCAT(N'Branch incremental failed: ', @ErrMsg);
         SELECT [Summary] = @Summary;
 
-        RAISERROR('usp_Sync_Branch_Incremental failed: %s',16,1,@msg);
         RETURN -50001;
-    END CATCH;
+    END CATCH
 END;
 GO

@@ -1,32 +1,3 @@
-/*
-Purpose:
-    Incrementally load new and updated employee absence records into the staging absences table.
-
-Source:
-    Source employee absence tables/views (OSD / care system source).
-
-Target:
-    Staging employee absences table.
-
-Run type:
-    Incremental.
-
-Run frequency:
-    Daily.
-
-Safe to re-run:
-    Usually YES.
-
-Notes:
-    - Must run AFTER employees incremental.
-    - Used by workforce and compliance reporting.
-*/
-
-/* ============================================================
-   File: Employees_Absences_Incremental.sql
-   Refactor: UUID (INACT_REF) changed from NVARCHAR(50) to INT end-to-end
-   ============================================================ */
-
 USE [DOM_LIVE];
 GO
 
@@ -36,16 +7,16 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 ALTER PROCEDURE [dbo].[usp_Sync_EmployeesAbsences_Incremental]
-    @ChunkSize        int  = 100000,
-    @LockTimeoutMs    int  = 60000,
-    @UseAppLock       bit  = 1,
-    @EmitInfo         bit  = 1,                          -- 0=quiet, 1=progress
-    @Summary          nvarchar(4000) = NULL OUTPUT,      -- one-line summary
-    @ReturnSummaryRow bit  = 1                           -- Initial sets this to 0
+    @ChunkSize       int  = 100000,
+    @LockTimeoutMs   int  = 60000,
+    @UseAppLock      bit  = 1,
+    @EmitProgress    bit  = 0,
+    @Summary         nvarchar(4000) = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
+    SET ANSI_WARNINGS ON;
 
     DECLARE @Process       sysname      = N'EmployeesAbsences';
     DECLARE @RunStartedAt  datetime2(3) = SYSUTCDATETIME();
@@ -54,54 +25,47 @@ BEGIN
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
 
-    /* 0) Concurrency guard */
+    DECLARE @Msg nvarchar(2047);
+
+    /* Concurrency */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:EmployeesAbsences';
-    DECLARE @LockOwner   sysname  = N'Session';
-    DECLARE @DbPrincipal sysname  = N'dbo';
-    DECLARE @lockResult  int;
-    DECLARE @lockHeld    bit      = 0;
+    DECLARE @LockOwner    sysname = N'Session';
+    DECLARE @DbPrincipal  sysname = N'dbo';
+    DECLARE @lockResult   int;
+    DECLARE @lockHeld     bit = 0;
 
     IF @UseAppLock = 1
     BEGIN
         EXEC @lockResult = sys.sp_getapplock
-            @Resource    = @LockResource,
-            @LockMode    = 'Exclusive',
-            @LockOwner   = @LockOwner,
-            @DbPrincipal = @DbPrincipal,
-            @LockTimeout = @LockTimeoutMs;
+            @Resource=@LockResource, @LockMode='Exclusive',
+            @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal, @LockTimeout=@LockTimeoutMs;
 
         IF @lockResult NOT IN (0,1)
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Could not acquire %s (sp_getapplock rc=%d).',16,1,@LockResource,@lockResult);
             SET @Summary = N'EmployeesAbsences incremental failed: could not acquire applock.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            RETURN @lockResult;
+            SELECT 'Incremental' AS Stage, @Summary AS Summary;
+            RETURN -1;
         END
+
         SET @lockHeld = 1;
     END
 
     BEGIN TRY
-        /* 1) Preconditions and watermark */
+        /* Preconditions */
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
-        BEGIN
-            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at the database level.',16,1);
-            SET @Summary = N'EmployeesAbsences incremental failed: CT not enabled at DB level.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            GOTO FinallyRelease;
-        END
+            RAISERROR('Change Tracking is not enabled at DB level.', 16, 1);
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.INACTIVE_DY'))
-        BEGIN
-            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled on dbo.INACTIVE_DY.',16,1);
-            SET @Summary = N'EmployeesAbsences incremental failed: CT not enabled on INACTIVE_DY.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            GOTO FinallyRelease;
-        END
+            RAISERROR('Change Tracking is not enabled on dbo.INACTIVE_DY.', 16, 1);
+
+        IF OBJECT_ID(N'dbo.tbl_EmployeesAbsences', N'U') IS NULL
+            RAISERROR('Target dbo.tbl_EmployeesAbsences not found. Run usp_Sync_EmployeesAbsences_Initial first.', 16, 1);
 
         DECLARE @CT_CHSYSDEC bit =
             CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC')) THEN 1 ELSE 0 END;
 
-        IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
+        /* Watermark table */
+        IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
             (
@@ -117,50 +81,42 @@ BEGIN
         DECLARE @LastSyncVersion bigint =
             (SELECT LastSyncVersion FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process);
 
-        /* Make sure watermark is still valid for the CT window */
+        /* Fence CT window at START */
+        DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
+
+        /* Min valid across referenced tables */
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
             FROM sys.change_tracking_tables
-            WHERE object_id IN (
+            WHERE object_id IN
+            (
                 OBJECT_ID(N'dbo.INACTIVE_DY'),
                 CASE WHEN @CT_CHSYSDEC=1 THEN OBJECT_ID(N'dbo.CHSYSDEC') ELSE NULL END
             )
         );
 
         IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
+            RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.', 16, 1, @LastSyncVersion, @MinValid);
+
+        IF @EmitProgress=1
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
-            SET @Summary = CONCAT(N'EmployeesAbsences incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N' (re-baseline).');
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            GOTO FinallyRelease;
+            SET @Msg = CONCAT(N'EmployeesAbsences CT window: From=', @LastSyncVersion, N' To=', @ToVersion);
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+            IF @CT_CHSYSDEC = 0
+                RAISERROR(N'Note: CT not enabled on CHSYSDEC; Reason text changes won''t be tracked.', 10, 1) WITH NOWAIT;
         END
 
-        DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
-
-        IF @EmitInfo=1
-        BEGIN
-            RAISERROR('EmployeesAbsences CT window:', 0, 1) WITH NOWAIT;
-            RAISERROR('  From = %I64d', 0, 1, @LastSyncVersion) WITH NOWAIT;
-            RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
-        END
-
-        /* 2) Build changed set (keys = INACT_REF INT) */
+        /* Build changed key set (UUID = INACT_REF) */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
-        CREATE TABLE #Changed
-        (
-            UUID INT NOT NULL PRIMARY KEY
-        );
+        CREATE TABLE #Changed (UUID INT NOT NULL PRIMARY KEY);
 
-        /* INACTIVE_DY inserted/updated */
         INSERT INTO #Changed(UUID)
-        SELECT DISTINCT idy.INACT_REF
+        SELECT DISTINCT ct.INACT_REF
         FROM CHANGETABLE(CHANGES dbo.INACTIVE_DY, @LastSyncVersion) ct
-        JOIN dbo.INACTIVE_DY idy ON idy.INACT_REF = ct.INACT_REF
-        WHERE ct.SYS_CHANGE_VERSION <= @ToVersion
-          AND ct.SYS_CHANGE_OPERATION IN ('I','U');
+        WHERE ct.SYS_CHANGE_VERSION <= @ToVersion;
 
-        /* CHSYSDEC description changes (optional) */
         IF @CT_CHSYSDEC = 1
         BEGIN
             INSERT INTO #Changed(UUID)
@@ -172,23 +128,53 @@ BEGIN
         END
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
-        IF @EmitInfo=1 RAISERROR('Absence rows to upsert: %d', 0, 1, @ToProcess) WITH NOWAIT;
 
-        /* 3) Chunked UPSERT */
-        DECLARE @TotalInserted int=0, @TotalUpdated int=0, @TotalDeleted int=0;
+        IF @EmitProgress=1
+        BEGIN
+            SET @Msg = CONCAT(N'EmployeesAbsences changed keys: ', @ToProcess);
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+
+        /* Fast path: no changes */
+        IF @ToProcess = 0
+        BEGIN
+            UPDATE dbo.CT_Watermark
+              SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
+            WHERE ProcessName=@Process;
+
+            SET @EndUTC = SYSUTCDATETIME();
+            SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
+            SET @DurationSec = DATEDIFF(SECOND, @RunStartedAt, @EndUTC);
+
+            SET @Summary = CONCAT(
+                N'EmployeesAbsences incremental started ', @StartIso, N' UTC; ended ', @EndIso,
+                N' UTC; inserted 0, updated 0, deleted 0; advanced watermark to ',
+                CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
+            );
+
+            SELECT 'Incremental' AS Stage, @Summary AS Summary;
+
+            IF @lockHeld=1
+                EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
+
+            RETURN 0;
+        END
+
+        /* Chunked MERGE */
+        DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted bigint = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
         BEGIN
             IF OBJECT_ID('tempdb..#Next') IS NOT NULL DROP TABLE #Next;
-            CREATE TABLE #Next(UUID INT NOT NULL PRIMARY KEY);
+            CREATE TABLE #Next (UUID INT NOT NULL PRIMARY KEY);
 
             INSERT INTO #Next(UUID)
             SELECT TOP (@ChunkSize) UUID
             FROM #Changed
             ORDER BY UUID;
-
+            
             IF OBJECT_ID('tempdb..#ActLog') IS NOT NULL DROP TABLE #ActLog;
-            CREATE TABLE #ActLog(Action nvarchar(10) NOT NULL);
+            CREATE TABLE #ActLog (Action nvarchar(10) NOT NULL);
 
             ;WITH Base AS
             (
@@ -199,20 +185,23 @@ BEGIN
                     [End_Date]    = idy.END_DTM,
                     [Start_Date]  = idy.START_DTM,
                     [Status]      = CASE idy.ALEAVESTAT
-                                      WHEN ''  THEN 'Entered'
-                                      WHEN 'C' THEN 'Confirmed'
-                                      WHEN 'P' THEN 'Part-Paid'
-                                      WHEN 'F' THEN 'Fully-Paid'
-                                      ELSE 'Unknown'
+                                    WHEN ''  THEN 'Entered'
+                                    WHEN 'C' THEN 'Confirmed'
+                                    WHEN 'P' THEN 'Part-Paid'
+                                    WHEN 'F' THEN 'Fully-Paid'
+                                    ELSE 'Unknown'
                                     END,
                     Comment       = idy.COMMENT
                 FROM dbo.INACTIVE_DY idy
                 JOIN #Next n              ON n.UUID = idy.INACT_REF
                 LEFT JOIN dbo.CHSYSDEC cr ON cr.DECODE_REF = idy.REASON
+                WHERE idy.EMP_REF <> 0
+                AND idy.rectype = 'E'
+                AND (cr.DESCRIPTION IS NULL OR cr.DESCRIPTION NOT IN ('From Another Branch','Input Error','Resigned ','Do not use'))
             )
             MERGE dbo.tbl_EmployeesAbsences AS tgt
             USING Base AS src
-               ON tgt.UUID = src.UUID
+            ON tgt.UUID = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
                     tgt.Employee_UUID = src.Employee_UUID,
@@ -225,41 +214,39 @@ BEGIN
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT (Employee_UUID, Reason, [End_Date], [Start_Date], [Status], UUID, Comment, CreatedAtUTC, UpdatedAtUTC)
                 VALUES (src.Employee_UUID, src.Reason, src.[End_Date], src.[Start_Date], src.[Status], src.UUID, src.Comment, @RunStartedAt, @RunStartedAt)
+            WHEN NOT MATCHED BY SOURCE
+                AND EXISTS (SELECT 1 FROM #Next nn WHERE nn.UUID = tgt.UUID)
+                THEN DELETE
             OUTPUT $action INTO #ActLog(Action);
 
-            DECLARE @i int=0, @u int=0;
+            DECLARE @i int = 0, @u int = 0, @d int = 0;
             SELECT
                 @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
-                @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END)
+                @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END),
+                @d = SUM(CASE WHEN Action='DELETE' THEN 1 ELSE 0 END)
             FROM #ActLog;
 
             SET @TotalInserted += ISNULL(@i,0);
             SET @TotalUpdated  += ISNULL(@u,0);
+            SET @TotalDeleted  += ISNULL(@d,0);
+
+            IF @EmitProgress=1
+            BEGIN
+                SET @Msg = CONCAT(
+                    N'EmployeesAbsences chunk: inserted=', @i,
+                    N' updated=', @u,
+                    N' deleted=', @d,
+                    N' (running ', @TotalInserted, N'/', @TotalUpdated, N'/', @TotalDeleted, N')'
+                );
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
 
             DELETE c
             FROM #Changed c
             JOIN #Next n ON n.UUID = c.UUID;
         END
 
-        /* 4) Apply deletes from INACTIVE_DY */
-        IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
-        CREATE TABLE #DelLog(UUID INT NOT NULL);
-
-        DELETE t
-        OUTPUT DELETED.UUID INTO #DelLog(UUID)
-        FROM dbo.tbl_EmployeesAbsences t
-        JOIN
-        (
-            SELECT d.INACT_REF
-            FROM CHANGETABLE(CHANGES dbo.INACTIVE_DY, @LastSyncVersion) d
-            WHERE d.SYS_CHANGE_OPERATION='D'
-              AND d.SYS_CHANGE_VERSION   <= @ToVersion
-        ) x ON t.UUID = x.INACT_REF;
-
-        SET @TotalDeleted = (SELECT COUNT(*) FROM #DelLog);
-        IF @EmitInfo=1 RAISERROR('Deleted due to source deletes: %d', 0, 1, @TotalDeleted) WITH NOWAIT;
-
-        /* 5) Advance watermark + summary */
+        /* Advance watermark */
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion=@ToVersion, LastSyncTime=SYSUTCDATETIME()
         WHERE ProcessName=@Process;
@@ -270,42 +257,27 @@ BEGIN
 
         SET @Summary = CONCAT(
             N'EmployeesAbsences incremental started ', @StartIso, N' UTC; ended ', @EndIso,
-            N' UTC; inserted ', @TotalInserted, N', updated ', @TotalUpdated,
-            N', deleted ', @TotalDeleted, N'; advanced watermark to ',
-            CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
+            N' UTC; inserted ', CAST(@TotalInserted AS nvarchar(20)),
+            N', updated ', CAST(@TotalUpdated AS nvarchar(20)),
+            N', deleted ', CAST(@TotalDeleted AS nvarchar(20)),
+            N'; advanced watermark to ', CAST(@ToVersion AS nvarchar(30)),
+            N'; duration=', CAST(@DurationSec AS nvarchar(20)), N' sec.'
         );
 
-        IF @EmitInfo=1
-        BEGIN
-            RAISERROR('EmployeesAbsences incremental complete.', 0, 1) WITH NOWAIT;
-            RAISERROR('  Inserted = %d', 0, 1, @TotalInserted) WITH NOWAIT;
-            RAISERROR('  Updated  = %d', 0, 1, @TotalUpdated) WITH NOWAIT;
-            RAISERROR('  Deleted  = %d', 0, 1, @TotalDeleted) WITH NOWAIT;
-        END
+        SELECT 'Incremental' AS Stage, @Summary AS Summary;
 
-        IF @ReturnSummaryRow=1
-            SELECT 'Incremental' AS Stage, @Summary AS Summary;
-
-FinallyRelease:
         IF @lockHeld=1
-            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+            EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
 
         RETURN 0;
     END TRY
     BEGIN CATCH
         IF @lockHeld=1
-            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
+            EXEC sys.sp_releaseapplock @Resource=@LockResource,@LockOwner=@LockOwner,@DbPrincipal=@DbPrincipal;
 
-        DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
-        DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(), @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
-        DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
-
-        IF @EmitInfo=1
-            RAISERROR('usp_Sync_EmployeesAbsences_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
-                      16,1,@num,@sev,@st,@procName,@lin,@msg);
-
-        SET @Summary = CONCAT(N'EmployeesAbsences incremental failed: ', @msg);
-        IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+        DECLARE @err nvarchar(4000) = ERROR_MESSAGE();
+        SET @Summary = CONCAT(N'EmployeesAbsences incremental failed: ', @err);
+        SELECT 'Incremental' AS Stage, @Summary AS Summary;
         RETURN -50001;
     END CATCH
 END;

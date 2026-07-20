@@ -1,52 +1,49 @@
 /*
 Purpose:
-    Incrementally load new and updated client diary records into the staging diary table.
+    Incrementally load new/updated/deleted client diary records into dbo.tbl_ClientDiary
+    using SQL Server Change Tracking.
 
 Source:
-    Source client diary tables/views (OSD / care system source).
+    dbo.CLIENT_DY (+ optional dbo.CHSYSDEC, dbo.CLIENT)
 
 Target:
-    Staging client diary table.
+    dbo.tbl_ClientDiary
 
 Run type:
-    Incremental.
+    Incremental (daily)
 
-Run frequency:
-    Daily.
-
-Safe to re-run:
-    Usually YES, depending on implementation (MERGE / NOT EXISTS logic).
+Design:
+    - Fences CT window at start (From watermark -> ToVersion)
+    - Chunked MERGE to control log/locks
+    - Optional purge of diary rows for deleted/deactivated clients (if CT enabled on dbo.CLIENT)
+    - Optional refresh when entry-type decode text changes (if CT enabled on dbo.CHSYSDEC)
+    - Safe to re-run (watermark advances only on success)
 
 Notes:
-    - Relies on date or last-modified logic.
-    - Must run AFTER clients incremental.
-    - Downstream reporting assumes this data is current.
+    - Requires CT enabled at DB level and on dbo.CLIENT_DY.
+    - Requires dbo.CLIENT_DY to have a primary key (used to re-join CHANGETABLE rows).
+    - Requires dbo.tbl_ClientDiary to exist (run initial first).
 */
-
-/* ============================================================
-   File: Client_Diary_Incremental.sql
-   Refactor: keys changed from VARCHAR to INT throughout
-   ============================================================ */
 
 USE [DOM_LIVE];
 GO
-
 SET ANSI_NULLS ON;
 GO
 SET QUOTED_IDENTIFIER ON;
 GO
 
-ALTER PROCEDURE [dbo].[usp_Sync_ClientDiary_Incremental]
+CREATE OR ALTER PROCEDURE [dbo].[usp_Sync_ClientDiary_Incremental]
     @ChunkSize         int  = 100000,
     @LockTimeoutMs     int  = 60000,
     @UseAppLock        bit  = 1,
-    @EmitInfo          bit  = 0,                          -- 0=silent, 1=print progress
+    @EmitInfo          bit  = 0,                          -- 0=silent, 1=progress
     @Summary           nvarchar(4000) = NULL OUTPUT,      -- one-line summary
     @ReturnSummaryRow  bit  = 1                           -- emit SELECT Stage/Summary row
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
+    SET ANSI_WARNINGS ON;
 
     DECLARE @Process       sysname      = N'ClientDiary';
     DECLARE @RunStartedAt  datetime2(3) = SYSUTCDATETIME();
@@ -55,12 +52,15 @@ BEGIN
     DECLARE @EndIso        varchar(33);
     DECLARE @DurationSec   int;
 
-    /* 0) Concurrency */
+    /* Concurrency */
     DECLARE @LockResource sysname = N'DOM_LIVE:Sync:ClientDiary';
-    DECLARE @LockOwner   sysname = N'Session';
-    DECLARE @DbPrincipal sysname = N'dbo';
-    DECLARE @lockResult  int;
-    DECLARE @lockHeld    bit = 0;
+    DECLARE @LockOwner    sysname = N'Session';
+    DECLARE @DbPrincipal  sysname = N'dbo';
+    DECLARE @lockResult   int;
+    DECLARE @lockHeld     bit = 0;
+
+    /* Single-exit helpers */
+    DECLARE @rc int = 0;
 
     IF @UseAppLock = 1
     BEGIN
@@ -73,53 +73,67 @@ BEGIN
 
         IF @lockResult NOT IN (0,1)
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Could not acquire %s (sp_getapplock rc=%d).',16,1,@LockResource,@lockResult);
             SET @Summary = N'ClientDiary incremental failed: could not acquire applock.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
             RETURN @lockResult;
         END
+
         SET @lockHeld = 1;
     END
 
     BEGIN TRY
-        /* 1) Preconditions & bounds */
+        /* ------------------------------------------------------------
+           1) Preconditions
+           ------------------------------------------------------------ */
+        IF OBJECT_ID(N'dbo.tbl_ClientDiary', N'U') IS NULL
+        BEGIN
+            SET @Summary = N'ClientDiary incremental failed: missing dbo.tbl_ClientDiary (run ClientDiary initial first).';
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
+            SET @rc = -300;
+            GOTO Finally;
+        END
+
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Change Tracking is not enabled at DB level.', 16, 1);
-            SET @Summary = N'ClientDiary incremental failed: CT not enabled at DB level.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -100;
+            SET @Summary = N'ClientDiary incremental failed: Change Tracking is not enabled at DB level.';
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
+            SET @rc = -100;
+            GOTO Finally;
         END
 
         IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CLIENT_DY'))
         BEGIN
-            IF @EmitInfo=1 RAISERROR('CT not enabled on dbo.CLIENT_DY.',16,1);
             SET @Summary = N'ClientDiary incremental failed: CT not enabled on dbo.CLIENT_DY.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -210;
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
+            SET @rc = -210;
+            GOTO Finally;
         END
 
         DECLARE @CT_CLIENT bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CLIENT'))   THEN 1 ELSE 0 END;
-        DECLARE @CT_CET    bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC')) THEN 1 ELSE 0 END;
+        DECLARE @CT_DEC    bit = CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CHSYSDEC')) THEN 1 ELSE 0 END;
 
-        IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
+        /* Watermark table */
+        IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
             (
-              ProcessName     sysname      PRIMARY KEY,
-              LastSyncVersion bigint       NOT NULL,
-              LastSyncTime    datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()
+                ProcessName     sysname      PRIMARY KEY,
+                LastSyncVersion bigint       NOT NULL,
+                LastSyncTime    datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()
             );
         END
 
         IF NOT EXISTS (SELECT 1 FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process)
+        BEGIN
             INSERT INTO dbo.CT_Watermark(ProcessName, LastSyncVersion) VALUES (@Process, 0);
+        END
 
         DECLARE @LastSyncVersion bigint =
             (SELECT LastSyncVersion FROM dbo.CT_Watermark WITH (HOLDLOCK, UPDLOCK) WHERE ProcessName=@Process);
 
+        DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
+
+        /* CT retention safety: if watermark is older than min valid => re-baseline */
         DECLARE @MinValid bigint =
         (
             SELECT MAX(CHANGE_TRACKING_MIN_VALID_VERSION(object_id))
@@ -128,29 +142,28 @@ BEGIN
             (
                 OBJECT_ID(N'dbo.CLIENT_DY'),
                 CASE WHEN @CT_CLIENT=1 THEN OBJECT_ID(N'dbo.CLIENT')   ELSE NULL END,
-                CASE WHEN @CT_CET=1    THEN OBJECT_ID(N'dbo.CHSYSDEC') ELSE NULL END
+                CASE WHEN @CT_DEC=1    THEN OBJECT_ID(N'dbo.CHSYSDEC') ELSE NULL END
             )
         );
 
         IF @MinValid IS NOT NULL AND @LastSyncVersion < @MinValid
         BEGIN
-            IF @EmitInfo=1 RAISERROR('Watermark (%I64d) < CT min valid (%I64d). Re-baseline required.',16,1,@LastSyncVersion,@MinValid);
-            SET @Summary = CONCAT(N'ClientDiary incremental failed: watermark ', @LastSyncVersion, N' < min valid ', @MinValid, N' (re-baseline).');
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -200;
+            SET @Summary = CONCAT(
+                N'ClientDiary incremental failed: watermark ', @LastSyncVersion,
+                N' < CT min valid ', @MinValid, N' (re-baseline required).'
+            );
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
+            SET @rc = -200;
+            GOTO Finally;
         END
-
-        DECLARE @ToVersion bigint = CHANGE_TRACKING_CURRENT_VERSION();
 
         IF @EmitInfo=1
-        BEGIN
-            RAISERROR('ClientDiary CT incremental window:', 0, 1) WITH NOWAIT;
-            RAISERROR('  From = %I64d', 0, 1, @LastSyncVersion) WITH NOWAIT;
-            RAISERROR('  To   = %I64d', 0, 1, @ToVersion) WITH NOWAIT;
-        END
+            RAISERROR('ClientDiary CT window: From=%I64d To=%I64d', 0, 1, @LastSyncVersion, @ToVersion) WITH NOWAIT;
 
-        /* 2) Build changed key set (INT keys) */
+        /* ------------------------------------------------------------
+           2) Build changed keyset
+              (ClientRef, DiaryRef) from CT changes on CLIENT_DY
+           ------------------------------------------------------------ */
         IF OBJECT_ID('tempdb..#Changed') IS NOT NULL DROP TABLE #Changed;
         CREATE TABLE #Changed
         (
@@ -159,8 +172,9 @@ BEGIN
             CONSTRAINT PK_Changed PRIMARY KEY (ClientRef, DiaryRef)
         );
 
-        /* Build dynamic join to CLIENT_DY PK for CHANGETABLE join */
+        /* Build join predicate back to CLIENT_DY using its real PK columns */
         DECLARE @JoinPK nvarchar(max);
+
         ;WITH pk AS
         (
             SELECT c.name AS colname, ic.key_ordinal
@@ -180,11 +194,10 @@ BEGIN
 
         IF @JoinPK IS NULL OR LEN(@JoinPK)=0
         BEGIN
-            IF @EmitInfo=1 RAISERROR('dbo.CLIENT_DY has no primary key; cannot join CHANGETABLE.', 16, 1);
-            SET @Summary = N'ClientDiary incremental failed: CLIENT_DY has no PK.';
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN -211;
+            SET @Summary = N'ClientDiary incremental failed: dbo.CLIENT_DY has no primary key (cannot re-join CHANGETABLE rows).';
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
+            SET @rc = -211;
+            GOTO Finally;
         END
 
         DECLARE @sql nvarchar(max) = N'
@@ -192,12 +205,17 @@ INSERT INTO #Changed(ClientRef, DiaryRef)
 SELECT DISTINCT cdy.CLIENT_REF, cdy.CL_DY_REF
 FROM CHANGETABLE(CHANGES dbo.CLIENT_DY, @fromV) AS x
 JOIN dbo.CLIENT_DY AS cdy ON ' + @JoinPK + N'
-WHERE x.SYS_CHANGE_VERSION <= @toV;';
+WHERE x.SYS_CHANGE_VERSION <= @toV;
+';
 
-        EXEC sp_executesql @sql, N'@fromV bigint, @toV bigint', @fromV=@LastSyncVersion, @toV=@ToVersion;
+        EXEC sys.sp_executesql
+            @sql,
+            N'@fromV bigint, @toV bigint',
+            @fromV=@LastSyncVersion,
+            @toV=@ToVersion;
 
-        /* Track entry-type description changes when CT is enabled on CHSYSDEC */
-        IF @CT_CET = 1
+        /* Optional: track decode-text changes affecting diary ENTRY_TYPE */
+        IF @CT_DEC = 1
         BEGIN
             INSERT INTO #Changed(ClientRef, DiaryRef)
             SELECT DISTINCT cdy.CLIENT_REF, cdy.CL_DY_REF
@@ -213,14 +231,11 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
               );
         END
         ELSE IF @EmitInfo=1
-            RAISERROR('Note: CT not enabled on CHSYSDEC; entry-type text updates not tracked.', 0, 1) WITH NOWAIT;
+            RAISERROR('Note: CT not enabled on CHSYSDEC; ENTRY_TYPE text changes will not trigger refresh.', 0, 1) WITH NOWAIT;
 
-        /* Find clients to purge (deleted or S/R) */
+        /* Optional: find clients to purge (deleted or S/R) */
         IF OBJECT_ID('tempdb..#ClientsToPurge') IS NOT NULL DROP TABLE #ClientsToPurge;
-        CREATE TABLE #ClientsToPurge
-        (
-            ClientRef INT NOT NULL PRIMARY KEY
-        );
+        CREATE TABLE #ClientsToPurge (ClientRef INT NOT NULL PRIMARY KEY);
 
         IF @CT_CLIENT = 1
         BEGIN
@@ -232,17 +247,19 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
               AND (x.SYS_CHANGE_OPERATION = 'D' OR c.RECTYPE IN ('S','R'));
         END
         ELSE IF @EmitInfo=1
-            RAISERROR('Note: CT not enabled on CLIENT; deactivations/deletes won''t purge diary rows automatically.', 0, 1) WITH NOWAIT;
+            RAISERROR('Note: CT not enabled on CLIENT; client deletes/SR will not auto-purge diary rows.', 0, 1) WITH NOWAIT;
 
         DECLARE @ToProcess int = (SELECT COUNT(*) FROM #Changed);
-        IF @EmitInfo=1 RAISERROR('Diary rows to process: %d', 0, 1, @ToProcess) WITH NOWAIT;
+
+        IF @EmitInfo=1
+            RAISERROR('Diary rows to process: %d', 0, 1, @ToProcess) WITH NOWAIT;
 
         IF @ToProcess = 0 AND NOT EXISTS (SELECT 1 FROM #ClientsToPurge)
         BEGIN
             UPDATE dbo.CT_Watermark
-              SET LastSyncVersion = @ToVersion,
-                  LastSyncTime    = SYSUTCDATETIME()
-            WHERE ProcessName = @Process;
+              SET LastSyncVersion=@ToVersion,
+                  LastSyncTime=SYSUTCDATETIME()
+            WHERE ProcessName=@Process;
 
             SET @EndUTC = SYSUTCDATETIME();
             SET @EndIso = CONVERT(varchar(33), @EndUTC, 126);
@@ -254,14 +271,14 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
                 CAST(@ToVersion AS nvarchar(30)), N'; duration=', @DurationSec, N' sec.'
             );
 
-            IF @EmitInfo=1 RAISERROR('No changes. Watermark advanced.', 0, 1) WITH NOWAIT;
-            IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
-
-            IF @lockHeld=1 EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
-            RETURN 0;
+            IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
+            SET @rc = 0;
+            GOTO Finally;
         END
 
-        /* 3) Chunked UPSERT */
+        /* ------------------------------------------------------------
+           3) Chunked MERGE
+           ------------------------------------------------------------ */
         DECLARE @TotalInserted bigint = 0, @TotalUpdated bigint = 0, @TotalDeleted int = 0;
 
         WHILE EXISTS (SELECT 1 FROM #Changed)
@@ -285,21 +302,16 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             ;WITH Base AS
             (
                 SELECT
-                    Client_UUID                = CAST(cdy.CLIENT_REF AS varchar(20)),
-                    UUID                       = CAST(cdy.CL_DY_REF  AS varchar(20)),
-                    Client_Diary_Entry_Date     = cdy.ENTRY_DATE,
-                    Client_Diary_Entry_Type     = LTRIM(RTRIM(cet.DESCRIPTION)),
-                    Client_Diary_Entry_Text     = cdy.ENTRY_TEXT,
-                    Client_Diary_Review_Date    = cdy.REVIEW_DATE,
-                    Client_Diary_Action         = CASE WHEN cdy.ACTION = 'Y' THEN 1 ELSE 0 END,
-                    Client_Diary_Action_Date    = cdy.ACTIONDT,
-                    Client_Diary_Done_Date      = cdy.REVDONE_DT,
-                    Client_Diary_Reminded       = CASE WHEN cdy.REMINDED = 'Y' THEN 1 ELSE 0 END
+                    Client_UUID            = cdy.CLIENT_REF,
+                    UUID                   = cdy.CL_DY_REF,
+                    Client_Diary_Entry_Date = cdy.ENTRY_DATE,
+                    Client_Diary_Entry_Type = NULLIF(LTRIM(RTRIM(cet.DESCRIPTION)), N''),
+                    Client_Diary_Entry_Text = cdy.ENTRY_TEXT
                 FROM dbo.CLIENT_DY cdy
                 JOIN #Next n
                   ON n.ClientRef = cdy.CLIENT_REF
                  AND n.DiaryRef  = cdy.CL_DY_REF
-                INNER JOIN dbo.CLIENT c
+                JOIN dbo.CLIENT c
                   ON c.CLIENT_REF = cdy.CLIENT_REF
                 LEFT JOIN dbo.CHSYSDEC cet
                   ON cet.DECODE_REF = cdy.ENTRY_TYPE
@@ -311,30 +323,21 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
               AND tgt.UUID        = src.UUID
             WHEN MATCHED THEN
                 UPDATE SET
-                    tgt.Client_Diary_Entry_Date   = src.Client_Diary_Entry_Date,
-                    tgt.Client_Diary_Entry_Type   = src.Client_Diary_Entry_Type,
-                    tgt.Client_Diary_Entry_Text   = src.Client_Diary_Entry_Text,
-                    tgt.Client_Diary_Review_Date  = src.Client_Diary_Review_Date,
-                    tgt.Client_Diary_Action       = src.Client_Diary_Action,
-                    tgt.Client_Diary_Action_Date  = src.Client_Diary_Action_Date,
-                    tgt.Client_Diary_Done_Date    = src.Client_Diary_Done_Date,
-                    tgt.Client_Diary_Reminded     = src.Client_Diary_Reminded,
-                    tgt.UpdatedAtUTC              = @RunStartedAt
+                    tgt.Client_Diary_Entry_Date = src.Client_Diary_Entry_Date,
+                    tgt.Client_Diary_Entry_Type = src.Client_Diary_Entry_Type,
+                    tgt.Client_Diary_Entry_Text = src.Client_Diary_Entry_Text,
+                    tgt.UpdatedAtUTC            = @RunStartedAt
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT
                 (
                     Client_UUID, UUID,
                     Client_Diary_Entry_Date, Client_Diary_Entry_Type, Client_Diary_Entry_Text,
-                    Client_Diary_Review_Date, Client_Diary_Action, Client_Diary_Action_Date,
-                    Client_Diary_Done_Date, Client_Diary_Reminded,
                     CreatedAtUTC, UpdatedAtUTC
                 )
                 VALUES
                 (
                     src.Client_UUID, src.UUID,
                     src.Client_Diary_Entry_Date, src.Client_Diary_Entry_Type, src.Client_Diary_Entry_Text,
-                    src.Client_Diary_Review_Date, src.Client_Diary_Action, src.Client_Diary_Action_Date,
-                    src.Client_Diary_Done_Date, src.Client_Diary_Reminded,
                     @RunStartedAt, @RunStartedAt
                 )
             WHEN NOT MATCHED BY SOURCE
@@ -342,13 +345,14 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
                  (
                      SELECT 1
                      FROM #Next nn
-                     WHERE CAST(nn.ClientRef AS varchar(20)) = tgt.Client_UUID
-                       AND CAST(nn.DiaryRef  AS varchar(20)) = tgt.UUID
+                     WHERE nn.ClientRef = tgt.Client_UUID
+                       AND nn.DiaryRef  = tgt.UUID
                  )
                  THEN DELETE
             OUTPUT $action INTO #ActLog(Action);
 
             DECLARE @i int = 0, @u int = 0, @d int = 0;
+
             SELECT
                 @i = SUM(CASE WHEN Action='INSERT' THEN 1 ELSE 0 END),
                 @u = SUM(CASE WHEN Action='UPDATE' THEN 1 ELSE 0 END),
@@ -360,7 +364,7 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             SET @TotalDeleted  += ISNULL(@d,0);
 
             IF @EmitInfo=1
-                RAISERROR('ClientDiary chunk upserted: inserted=%d updated=%d deleted=%d (running %d/%d/%d)',
+                RAISERROR('ClientDiary chunk: inserted=%d updated=%d deleted=%d (running %d/%d/%d)',
                           0,1,@i,@u,@d,@TotalInserted,@TotalUpdated,@TotalDeleted) WITH NOWAIT;
 
             DELETE c
@@ -373,22 +377,25 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
         /* Purge for client deletes/SR */
         IF EXISTS (SELECT 1 FROM #ClientsToPurge)
         BEGIN
-            IF OBJECT_ID('tempdb..#DelLog') IS NOT NULL DROP TABLE #DelLog;
-            CREATE TABLE #DelLog (ClientRef varchar(20) NOT NULL);
+            IF OBJECT_ID('tempdb..#PurgeLog') IS NOT NULL DROP TABLE #PurgeLog;
+            CREATE TABLE #PurgeLog (ClientRef INT NOT NULL);
 
             DELETE tgt
-            OUTPUT DELETED.Client_UUID INTO #DelLog(ClientRef)
+            OUTPUT DELETED.Client_UUID INTO #PurgeLog(ClientRef)
             FROM dbo.tbl_ClientDiary tgt
-            JOIN #ClientsToPurge p ON CAST(p.ClientRef AS varchar(20)) = tgt.Client_UUID;
+            JOIN #ClientsToPurge p
+              ON p.ClientRef = tgt.Client_UUID;
 
-            DECLARE @Purged int = (SELECT COUNT(*) FROM #DelLog);
+            DECLARE @Purged int = (SELECT COUNT(*) FROM #PurgeLog);
             SET @TotalDeleted += @Purged;
 
             IF @EmitInfo=1
-                RAISERROR('Purged diary rows for deactivated/deleted clients: %d', 0, 1, @Purged) WITH NOWAIT;
+                RAISERROR('Purged diary rows for deleted/deactivated clients: %d', 0, 1, @Purged) WITH NOWAIT;
         END
 
-        /* 5) Advance watermark + summary */
+        /* ------------------------------------------------------------
+           4) Advance watermark + summary
+           ------------------------------------------------------------ */
         UPDATE dbo.CT_Watermark
           SET LastSyncVersion=@ToVersion,
               LastSyncTime=SYSUTCDATETIME()
@@ -407,38 +414,32 @@ WHERE x.SYS_CHANGE_VERSION <= @toV;';
             N'; duration=', CAST(@DurationSec AS nvarchar(20)), N' sec.'
         );
 
-        IF @EmitInfo=1
-        BEGIN
-            RAISERROR('ClientDiary incremental sync complete.', 0, 1) WITH NOWAIT;
-            RAISERROR('  Inserted = %d', 0, 1, @TotalInserted) WITH NOWAIT;
-            RAISERROR('  Updated  = %d', 0, 1, @TotalUpdated) WITH NOWAIT;
-            RAISERROR('  Deleted  = %d', 0, 1, @TotalDeleted) WITH NOWAIT;
-        END
-
         IF @ReturnSummaryRow=1
-            SELECT 'Incremental' AS Stage, @Summary AS Summary;
+            SELECT N'Incremental' AS Stage, @Summary AS Summary;
 
+        SET @rc = 0;
+
+Finally:
         IF @lockHeld=1
             EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
 
-        RETURN 0;
+        RETURN @rc;
     END TRY
     BEGIN CATCH
         IF @lockHeld=1
             EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner=@LockOwner, @DbPrincipal=@DbPrincipal;
 
-        DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
+        DECLARE @err nvarchar(4000)=ERROR_MESSAGE();
         DECLARE @num int=ERROR_NUMBER(), @sev int=ERROR_SEVERITY(), @st int=ERROR_STATE(),
                 @lin int=ERROR_LINE(), @proc sysname=ERROR_PROCEDURE();
-
         DECLARE @procName sysname = ISNULL(@proc, N'<adhoc>');
 
         IF @EmitInfo=1
             RAISERROR('usp_Sync_ClientDiary_Incremental failed (%d, sev %d, state %d) at %s line %d: %s',
-                      16,1,@num,@sev,@st,@procName,@lin,@msg);
+                      16,1,@num,@sev,@st,@procName,@lin,@err);
 
-        SET @Summary = CONCAT(N'ClientDiary incremental failed: ', @msg);
-        IF @ReturnSummaryRow=1 SELECT 'Incremental' AS Stage, @Summary AS Summary;
+        SET @Summary = CONCAT(N'ClientDiary incremental failed: ', @err);
+        IF @ReturnSummaryRow=1 SELECT N'Incremental' AS Stage, @Summary AS Summary;
 
         RETURN -50001;
     END CATCH

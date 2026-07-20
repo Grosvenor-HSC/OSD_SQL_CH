@@ -1,40 +1,9 @@
-/*
-Purpose:
-    Perform the initial full load of client diary records into the staging diary table.
-    This establishes the baseline client diary dataset.
-
-Source:
-    Source client diary tables/views (OSD / care system source).
-
-Target:
-    Staging client diary table.
-
-Run type:
-    Initial (full backfill).
-
-Run frequency:
-    One-time only.
-
-Safe to re-run:
-    NO.
-    Reloads the full diary history and may truncate or overwrite data.
-
-Notes:
-    - Must be run AFTER clients initial load.
-    - Must be run BEFORE diary incremental scripts.
-    - Used by downstream reporting and compliance analysis.
-*/
-
-/* ============================================================
-   File: Client_Diary_Initial.sql
-   Refactor: Client_UUID + UUID changed from VARCHAR to INT
-   ============================================================ */
-
 USE [DOM_LIVE];
 GO
 
 SET ANSI_NULLS ON;
 GO
+
 SET QUOTED_IDENTIFIER ON;
 GO
 
@@ -52,97 +21,175 @@ BEGIN
     DECLARE @lockResult    int;
     DECLARE @lockHeld      bit          = 0;
 
-    /* applock */
     EXEC @lockResult = sys.sp_getapplock
-        @Resource=@LockResource, @LockMode='Exclusive',
-        @LockOwner='Session', @DbPrincipal='dbo', @LockTimeout=600000;
+        @Resource = @LockResource,
+        @LockMode = 'Exclusive',
+        @LockOwner = 'Session',
+        @DbPrincipal = 'dbo',
+        @LockTimeout = 600000;
 
-    IF @lockResult NOT IN (0,1)
+    IF @lockResult NOT IN (0, 1)
     BEGIN
-        SELECT 'Initial' AS Stage,
-               CAST(N'ClientDiary initial failed: could not acquire applock.' AS nvarchar(4000)) AS Summary;
+        SELECT
+            'Initial' AS Stage,
+            CAST(
+                N'ClientDiary initial failed: could not acquire applock.'
+                AS nvarchar(4000)
+            ) AS Summary;
+
         RETURN -1;
-    END
+    END;
+
     SET @lockHeld = 1;
 
     BEGIN TRY
-        /* Preconditions */
-        IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID())
-            RAISERROR('Change Tracking is not enabled at the database level.', 16, 1);
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.change_tracking_databases
+            WHERE database_id = DB_ID()
+        )
+        BEGIN
+            THROW 50001, 'Change Tracking is not enabled at the database level.', 1;
+        END;
 
-        IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = OBJECT_ID(N'dbo.CLIENT_DY'))
-            RAISERROR('Change Tracking is not enabled on dbo.CLIENT_DY.', 16, 1);
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.change_tracking_tables
+            WHERE object_id = OBJECT_ID(N'dbo.CLIENT_DY')
+        )
+        BEGIN
+            THROW 50002, 'Change Tracking is not enabled on dbo.CLIENT_DY.', 1;
+        END;
 
-        /* CT snapshot at start */
         SET @BaselineFrom = CHANGE_TRACKING_CURRENT_VERSION();
 
-        /* Watermark seed/refresh */
-        IF OBJECT_ID('dbo.CT_Watermark','U') IS NULL
+        IF OBJECT_ID(N'dbo.CT_Watermark', N'U') IS NULL
         BEGIN
             CREATE TABLE dbo.CT_Watermark
             (
-              ProcessName     sysname      PRIMARY KEY,
-              LastSyncVersion bigint       NOT NULL,
-              LastSyncTime    datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()
+                ProcessName     sysname      NOT NULL,
+                LastSyncVersion bigint       NOT NULL,
+                LastSyncTime    datetime2(3) NOT NULL
+                    CONSTRAINT DF_CT_Watermark_LastSyncTime
+                    DEFAULT SYSUTCDATETIME(),
+
+                CONSTRAINT PK_CT_Watermark
+                    PRIMARY KEY (ProcessName)
             );
         END;
 
-        MERGE dbo.CT_Watermark AS t
-        USING (SELECT @Process AS ProcessName) s
-          ON t.ProcessName = s.ProcessName
-        WHEN MATCHED THEN
-            UPDATE SET LastSyncVersion=@BaselineFrom, LastSyncTime=SYSUTCDATETIME()
-        WHEN NOT MATCHED THEN
-            INSERT(ProcessName, LastSyncVersion, LastSyncTime)
-            VALUES(@Process, @BaselineFrom, SYSUTCDATETIME());
+        MERGE dbo.CT_Watermark AS target
+        USING
+        (
+            SELECT @Process AS ProcessName
+        ) AS source
+            ON target.ProcessName = source.ProcessName
 
-        /* Recreate target */
-        IF OBJECT_ID('dbo.tbl_ClientDiary', 'U') IS NOT NULL
+        WHEN MATCHED THEN
+            UPDATE SET
+                LastSyncVersion = @BaselineFrom,
+                LastSyncTime = SYSUTCDATETIME()
+
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                ProcessName,
+                LastSyncVersion,
+                LastSyncTime
+            )
+            VALUES
+            (
+                @Process,
+                @BaselineFrom,
+                SYSUTCDATETIME()
+            );
+
+        IF OBJECT_ID(N'dbo.tbl_ClientDiary', N'U') IS NOT NULL
+        BEGIN
             DROP TABLE dbo.tbl_ClientDiary;
+        END;
 
         CREATE TABLE dbo.tbl_ClientDiary
         (
-            Client_UUID                 INT           NOT NULL,
-            UUID                        INT           NOT NULL,
-            Client_Diary_Entry_Date     DATETIME      NULL,
-            Client_Diary_Entry_Type     NVARCHAR(255) NULL,
-            Client_Diary_Entry_Text     NVARCHAR(MAX) NULL,
-            CreatedAtUTC                datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientDiary_CreatedAtUTC DEFAULT SYSUTCDATETIME(),
-            UpdatedAtUTC                datetime2(3)  NOT NULL CONSTRAINT DF_tbl_ClientDiary_UpdatedAtUTC DEFAULT SYSUTCDATETIME(),
-            CONSTRAINT PK_tbl_ClientDiary PRIMARY KEY (Client_UUID, UUID)
+            Client_UUID                 varchar(20)    NOT NULL,
+            UUID                        varchar(20)    NOT NULL,
+            Client_Diary_Entry_Date     date           NULL,
+            Client_Diary_Entry_Type     nvarchar(255)  NULL,
+            Client_Diary_Entry_Text     nvarchar(max)  NULL,
+            Client_Diary_Review_Date    date           NULL,
+            Client_Diary_Action         bit            NULL,
+            Client_Diary_Action_Date    date           NULL,
+            Client_Diary_Done_Date      date           NULL,
+            Client_Diary_Reminded       bit            NULL,
+
+            CreatedAtUTC datetime2(3) NOT NULL
+                CONSTRAINT DF_tbl_ClientDiary_CreatedAtUTC
+                DEFAULT SYSUTCDATETIME(),
+
+            UpdatedAtUTC datetime2(3) NOT NULL
+                CONSTRAINT DF_tbl_ClientDiary_UpdatedAtUTC
+                DEFAULT SYSUTCDATETIME(),
+
+            CONSTRAINT PK_tbl_ClientDiary
+                PRIMARY KEY (Client_UUID, UUID)
         );
 
-        /* Baseline load (dynamic SQL retained, but no CAST-to-varchar) */
         DECLARE @sql nvarchar(max) = N'
 INSERT INTO dbo.tbl_ClientDiary
 (
-    Client_UUID, UUID,
-    Client_Diary_Entry_Date, Client_Diary_Entry_Type, Client_Diary_Entry_Text,
-    CreatedAtUTC, UpdatedAtUTC
+    Client_UUID,
+    UUID,
+    Client_Diary_Entry_Date,
+    Client_Diary_Entry_Type,
+    Client_Diary_Entry_Text,
+    Client_Diary_Review_Date,
+    Client_Diary_Action,
+    Client_Diary_Action_Date,
+    Client_Diary_Done_Date,
+    Client_Diary_Reminded,
+    CreatedAtUTC,
+    UpdatedAtUTC
 )
 SELECT
-    CDY.CLIENT_REF                         AS Client_UUID,
-    CDY.CL_DY_REF                          AS UUID,
-    CDY.ENTRY_DATE                         AS Client_Diary_Entry_Date,
-    CET.DESCRIPTION                        AS Client_Diary_Entry_Type,
-    CDY.ENTRY_TEXT                         AS Client_Diary_Entry_Text,
-    @RunStartedAt                          AS CreatedAtUTC,
-    @RunStartedAt                          AS UpdatedAtUTC
-FROM dbo.CLIENT_DY AS CDY WITH (NOLOCK)
-JOIN dbo.CLIENT AS C WITH (NOLOCK)
-  ON C.CLIENT_REF = CDY.CLIENT_REF
-LEFT JOIN dbo.CHSYSDEC AS CET WITH (NOLOCK)
-  ON CET.DECODE_REF = CDY.ENTRY_TYPE
-WHERE C.RECTYPE NOT IN (''S'',''R'');';
+    CAST(CDY.CLIENT_REF AS varchar(20)),
+    CAST(CDY.CL_DY_REF AS varchar(20)),
+    CDY.ENTRY_DATE,
+    CET.DESCRIPTION,
+    CDY.ENTRY_TEXT,
+    CDY.REVIEW_DATE,
+    CASE
+        WHEN CDY.ACTION = ''Y'' THEN CAST(1 AS bit)
+        ELSE CAST(0 AS bit)
+    END,
+    CDY.ACTIONDT,
+    CDY.REVDONE_DT,
+    CASE
+        WHEN CDY.REMINDED = ''Y'' THEN CAST(1 AS bit)
+        ELSE CAST(0 AS bit)
+    END,
+    @RunStartedAt,
+    @RunStartedAt
+FROM dbo.CLIENT_DY AS CDY
+INNER JOIN dbo.CLIENT AS C
+    ON C.CLIENT_REF = CDY.CLIENT_REF
+LEFT JOIN dbo.CHSYSDEC AS CET
+    ON CET.DECODE_REF = CDY.ENTRY_TYPE
+WHERE C.RECTYPE NOT IN (''S'', ''R'');';
 
-        EXEC sp_executesql
+        DECLARE @params nvarchar(200) =
+            N'@RunStartedAt datetime2(3)';
+
+        DECLARE @Inserted int;
+
+        EXEC sys.sp_executesql
             @sql,
-            N'@RunStartedAt datetime2(3)',
+            @params,
             @RunStartedAt = @RunStartedAt;
 
-        DECLARE @Inserted int = @@ROWCOUNT;
+        SET @Inserted = @@ROWCOUNT;
 
-        /* Indexes */
         CREATE NONCLUSTERED INDEX IX_tbl_ClientDiary_Client
             ON dbo.tbl_ClientDiary (Client_UUID)
             INCLUDE (Client_Diary_Entry_Date);
@@ -153,49 +200,84 @@ WHERE C.RECTYPE NOT IN (''S'',''R'');';
         CREATE NONCLUSTERED INDEX IX_tbl_ClientDiary_EntryType
             ON dbo.tbl_ClientDiary (Client_Diary_Entry_Type);
 
-        /* Build initial line */
         DECLARE @EndInitialUTC datetime2(3) = SYSUTCDATETIME();
-        DECLARE @EndInitialIso varchar(33)  = CONVERT(varchar(33), @EndInitialUTC, 126);
+        DECLARE @EndInitialIso varchar(33) =
+            CONVERT(varchar(33), @EndInitialUTC, 126);
 
         DECLARE @InitialMsg nvarchar(4000) =
-            CONCAT(N'ClientDiary initial started ', @StartIso,
-                   N' UTC; ended ', @EndInitialIso,
-                   N' UTC; baseline inserted ', @Inserted, N' rows.');
+            CONCAT
+            (
+                N'ClientDiary initial started ',
+                @StartIso,
+                N' UTC; ended ',
+                @EndInitialIso,
+                N' UTC; baseline inserted ',
+                @Inserted,
+                N' rows.'
+            );
 
-        /* Quiet incremental sweep */
         DECLARE @IncrMsg nvarchar(4000) = N'Incremental skipped.';
-        IF OBJECT_ID('dbo.usp_Sync_ClientDiary_Incremental','P') IS NOT NULL
+
+        IF OBJECT_ID(N'dbo.usp_Sync_ClientDiary_Incremental', N'P') IS NOT NULL
         BEGIN
             DECLARE @rc int;
+
             EXEC @rc = dbo.usp_Sync_ClientDiary_Incremental
-                @ChunkSize=100000,
-                @LockTimeoutMs=600000,
-                @UseAppLock=0,
-                @EmitInfo=0,
-                @Summary=@IncrMsg OUTPUT;
+                @ChunkSize = 100000,
+                @LockTimeoutMs = 600000,
+                @UseAppLock = 0,
+                @EmitInfo = 0,
+                @Summary = @IncrMsg OUTPUT;
 
-            IF (@rc < 0)
-                SET @IncrMsg = CONCAT(@IncrMsg, N' (rc=', @rc, N')');
-        END
+            IF @rc < 0
+            BEGIN
+                SET @IncrMsg =
+                    CONCAT(@IncrMsg, N' (rc=', @rc, N')');
+            END;
+        END;
 
-        /* Return two rows: Initial + Incremental */
-        SELECT 'Initial' AS Stage,     @InitialMsg AS Summary
+        SELECT
+            'Initial' AS Stage,
+            @InitialMsg AS Summary
+
         UNION ALL
-        SELECT 'Incremental',          @IncrMsg;
 
-        IF @lockHeld=1
-            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner='Session', @DbPrincipal='dbo';
+        SELECT
+            'Incremental',
+            @IncrMsg;
+
+        IF @lockHeld = 1
+        BEGIN
+            EXEC sys.sp_releaseapplock
+                @Resource = @LockResource,
+                @LockOwner = 'Session',
+                @DbPrincipal = 'dbo';
+
+            SET @lockHeld = 0;
+        END;
 
         RETURN 0;
     END TRY
     BEGIN CATCH
-        IF @lockHeld=1
-            EXEC sys.sp_releaseapplock @Resource=@LockResource, @LockOwner='Session', @DbPrincipal='dbo';
+        IF @lockHeld = 1
+        BEGIN
+            EXEC sys.sp_releaseapplock
+                @Resource = @LockResource,
+                @LockOwner = 'Session',
+                @DbPrincipal = 'dbo';
+        END;
 
-        DECLARE @msg nvarchar(4000)=ERROR_MESSAGE();
-        SELECT 'Initial' AS Stage,
-               CAST(CONCAT(N'ClientDiary initial failed: ', @msg) AS nvarchar(4000)) AS Summary;
+        DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
+
+        SELECT
+            'Initial' AS Stage,
+            CAST
+            (
+                CONCAT(N'ClientDiary initial failed: ', @msg)
+                AS nvarchar(4000)
+            ) AS Summary;
+
         RETURN -50001;
-    END CATCH
+    END CATCH;
 END;
 GO
