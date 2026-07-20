@@ -37,6 +37,7 @@ BEGIN
     DECLARE @Process      sysname      = N'VisitsPurge';
     DECLARE @RunStartedAt datetime2(3) = SYSUTCDATETIME();
     DECLARE @CutoffUTC    datetime2(3);
+    DECLARE @CutoffText   varchar(33);
     DECLARE @BatchDeleted int;
     DECLARE @TotalDeleted bigint = 0;
     DECLARE @BatchNo      int = 0;
@@ -55,10 +56,8 @@ BEGIN
     IF @LockTimeoutMs IS NULL OR @LockTimeoutMs < 0
         THROW 50012, 'Visits purge: @LockTimeoutMs must be zero or greater.', 1;
 
-    IF OBJECT_ID(N'dbo.tbl_Visits', N'U') IS NULL
-        THROW 50013, 'Visits purge: dbo.tbl_Visits does not exist.', 1;
-
     SET @CutoffUTC = DATEADD(YEAR, -@RetentionYears, SYSUTCDATETIME());
+    SET @CutoffText = CONVERT(varchar(33), @CutoffUTC, 126);
 
     BEGIN TRY
         IF @UseAppLock = 1
@@ -76,9 +75,13 @@ BEGIN
             SET @LockHeld = 1;
         END;
 
+        /* Check after the lock so an initial Visits rebuild cannot race this check. */
+        IF OBJECT_ID(N'dbo.tbl_Visits', N'U') IS NULL
+            THROW 50013, 'Visits purge: dbo.tbl_Visits does not exist.', 1;
+
         IF @EmitInfo = 1
             RAISERROR('Visits purge started. Cutoff UTC=%s, batch size=%d',
-                      10, 1, CONVERT(varchar(33), @CutoffUTC, 126), @BatchSize) WITH NOWAIT;
+                      10, 1, @CutoffText, @BatchSize) WITH NOWAIT;
 
         SET @BatchDeleted = 1;
 
