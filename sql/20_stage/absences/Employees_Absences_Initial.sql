@@ -180,26 +180,13 @@ BEGIN
                     @ChunkSize        = 100000,
                     @LockTimeoutMs    = 600000,
                     @UseAppLock       = 0,
-                    @EmitInfo         = 0,
-                    @Summary          = @IncrMsg OUTPUT,
-                    @ReturnSummaryRow = 0;
+                    @EmitProgress     = 0,
+                    @Summary          = @IncrMsg OUTPUT;
 
                 IF @IncrMsg = N'' SET @IncrMsg = CONCAT(N'EmployeesAbsences incremental ran (rc=', @rc, N').');
             END TRY
             BEGIN CATCH
-                -- fallback legacy signature
-                BEGIN TRY
-                    SET @rc = 0;
-                    EXEC @rc = dbo.usp_Sync_EmployeesAbsences_Incremental
-                        @ChunkSize     = 100000,
-                        @LockTimeoutMs = 600000,
-                        @UseAppLock    = 0,
-                        @EmitInfo      = 0;
-                    SET @IncrMsg = CONCAT(N'EmployeesAbsences incremental ran (legacy signature, rc=', @rc, N').');
-                END TRY
-                BEGIN CATCH
-                    SET @IncrMsg = CONCAT(N'EmployeesAbsences incremental failed to run: ', ERROR_MESSAGE());
-                END CATCH
+                SET @IncrMsg = CONCAT(N'EmployeesAbsences incremental failed to run: ', ERROR_MESSAGE());
             END CATCH
         END
 
