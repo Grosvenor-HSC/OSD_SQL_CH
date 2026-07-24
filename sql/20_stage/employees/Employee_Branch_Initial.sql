@@ -225,6 +225,7 @@ BEGIN
             FROM dbo.DISTKEY AS DK
             WHERE TRY_CONVERT(int, DK.INPRIKEY) IS NOT NULL
               AND TRY_CONVERT(int, DK.OUTPRIKEY) IS NOT NULL
+              AND DK.START_DATE IS not NULL
         ),
         Base AS
         (

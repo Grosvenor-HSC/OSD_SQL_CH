@@ -261,21 +261,10 @@ FROM CHANGETABLE(CHANGES dbo.DISTKEY, @fromV) AS ct
 JOIN dbo.DISTKEY AS dk
   ON ' + @JoinPK + N'
 WHERE ct.SYS_CHANGE_VERSION <= @toV
+  AND dk.START_DATE IS not NULL
   AND ct.SYS_CHANGE_OPERATION IN (''I'',''U'')
   AND TRY_CONVERT(int, dk.INPRIKEY)  IS NOT NULL
   AND TRY_CONVERT(int, dk.OUTPRIKEY) IS NOT NULL;
-
-/* Deletes -> #DeletedPairs (cannot join to dk, so use ct values)
-   Note: assumes PK columns include INPRIKEY/OUTPRIKEY. If not, re-baseline design needed. */
-INSERT INTO #DeletedPairs(Employee_UUID, Old_Branch_UUID)
-SELECT DISTINCT
-    TRY_CONVERT(int, ct.INPRIKEY),
-    TRY_CONVERT(int, ct.OUTPRIKEY)
-FROM CHANGETABLE(CHANGES dbo.DISTKEY, @fromV) AS ct
-WHERE ct.SYS_CHANGE_VERSION <= @toV
-  AND ct.SYS_CHANGE_OPERATION = ''D''
-  AND TRY_CONVERT(int, ct.INPRIKEY)  IS NOT NULL
-  AND TRY_CONVERT(int, ct.OUTPRIKEY) IS NOT NULL;
 ';
 
         EXEC sys.sp_executesql @sql,
